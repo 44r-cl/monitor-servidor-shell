@@ -1,0 +1,8 @@
+[client]
+host=df-instancia-01.cv84n8mlcfha.us-east-2.rds.amazonaws.com
+port=3306
+user=admin
+password=xxxxxxx
+connect-timeout=5
+
+#ssl-mode=REQUIRED

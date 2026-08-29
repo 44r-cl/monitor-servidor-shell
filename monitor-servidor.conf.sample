@@ -1,0 +1,156 @@
+# Configuración de monitor-servidor.sh
+# Copiar a: /etc/monitor-servidor/monitor-servidor.conf
+# Permisos sugeridos: 0600 root:root
+
+###############################################################################
+# Pushover
+###############################################################################
+
+USER_KEY="user-key-aquí"
+API_TOKEN="api-token-aqui"
+PUSHOVER_HABILITADO=1
+
+# Repite una alerta todavía activa como máximo cada 30 minutos.
+SEGUNDOS_COOLDOWN_ALERTA=1800
+ALERTAR_RECUPERACION=1
+
+###############################################################################
+# Estado y ejecución
+###############################################################################
+
+NOMBRE_SERVIDOR="df-ec2"
+DIRECTORIO_ESTADO="/var/lib/monitor-servidor"
+ARCHIVO_LOG="/var/log/monitor-servidor/monitor.log"
+INTERVALO_DAEMON=60
+MAX_GAP_ESTADO=180
+
+###############################################################################
+# Linux / EC2
+###############################################################################
+
+# CPU >= 85% por 5 minutos.
+UMBRAL_CPU_SISTEMA_PCT=85
+TIEMPO_SOSTENIDO_CPU=300
+SEGUNDOS_MUESTRA_CPU=2
+
+# RAM usada >= 90% por 2 minutos.
+UMBRAL_MEMORIA_SISTEMA_PCT=90
+TIEMPO_SOSTENIDO_MEMORIA=120
+
+###############################################################################
+# Apache prefork
+###############################################################################
+
+APACHE_SERVICIO="apache2"
+APACHE_PROCESO="apache2"
+APACHE_STATUS_URL="http://127.0.0.1/server-status?auto"
+
+# Si Apache necesita un VirtualHost concreto para server-status:
+# APACHE_HOST_HEADER="www.ejemplo.com"
+APACHE_HOST_HEADER=""
+
+# Debe coincidir con la configuración real de Apache.
+APACHE_MAX_REQUEST_WORKERS=175
+
+# Alertar si BusyWorkers llega a 90% de MaxRequestWorkers durante 2 min.
+UMBRAL_APACHE_SATURACION_PCT=90
+TIEMPO_SOSTENIDO_APACHE=120
+
+# Conexiones TCP ESTABLISHED hacia puertos 80/443.
+UMBRAL_APACHE_CONEXIONES=250
+TIEMPO_SOSTENIDO_CONEXIONES_APACHE=120
+
+# Logs Apache por sitio. Formato: nombre|error.log|access.log
+# Se pueden agregar tantos VirtualHosts como sea necesario.
+# No use el carácter | dentro del nombre del sitio ni de las rutas.
+# Si un sitio no tiene uno de los dos logs, deje ese campo vacío.
+APACHE_SITIOS_LOGS=(
+    "vitaticket|/var/log/apache2/vitaticket.error.log|/var/log/apache2/vitaticket.access.log"
+    "vitacuracorporacioncultural|/var/log/apache2/vitacuracorporacioncultural.cl-error.log|/var/log/apache2/vitacuracorporacioncultural.cl-access.log"
+    # "sitio-a|/var/log/apache2/sitio-a-error.log|/var/log/apache2/sitio-a-access.log"
+    # "sitio-b|/var/log/apache2/sitio-b-error.log|/var/log/apache2/sitio-b-access.log"
+    # "apache-global|/var/log/apache2/error.log|"
+)
+
+CHECK_CONFIG_ERRORS=true
+REGEX_APACHE_CONFIG_ERROR='Syntax error|Cannot load module|internal redirects'
+UMBRAL_APACHE_CONFIG_ERROR=1
+
+CHECK_RESOURCE_ERRORS=true
+REGEX_APACHE_RESOURCE_ERROR='MaxRequestWorkers|Out of memory|Error reading from remote server'
+UMBRAL_APACHE_RESOURCE_ERROR=3
+
+# HTTP 5xx se analiza sobre access.log por código de estado HTTP.
+# La regex asume un LogFormat Apache common/combined. Si usa un formato
+# personalizado, ajuste esta expresión sin modificar el script.
+CHECK_HTTP_ERRORS=true
+REGEX_APACHE_HTTP_ERROR='"[[:space:]]5[0-9][0-9][[:space:]]'
+UMBRAL_APACHE_HTTP_ERROR=5
+
+CHECK_SECURITY_ERRORS=true
+REGEX_APACHE_SECURITY_ERROR='client denied|AH01630.*client denied|authentication failure'
+UMBRAL_APACHE_SECURITY_ERROR=2
+
+###############################################################################
+# MySQL / AWS RDS
+###############################################################################
+
+MYSQL_CNF="/etc/monitor-servidor/mysql.cnf"
+MYSQL_TIMEOUT=5
+MYSQL_INTENTOS=2
+
+# Alerta por porcentaje de max_connections.
+UMBRAL_MYSQL_CONEXIONES_PCT=80
+
+# Threads actualmente ejecutándose, no dormidos.
+UMBRAL_MYSQL_THREADS_RUNNING=30
+
+# Slow_queries nuevos normalizados por minuto.
+UMBRAL_MYSQL_SLOW_POR_MINUTO=10
+
+# Tiempo sostenido para conexiones/threads/slow queries.
+TIEMPO_SOSTENIDO_MYSQL=120
+
+###############################################################################
+# AWS CLI / CloudWatch
+###############################################################################
+
+AWS_CLI_HABILITADO=1
+
+# Perfil dedicado configurado con:
+# aws configure --profile agente-control-monitoring
+AWS_PROFILE="agente-control-monitoring"
+AWS_REGION="us-east-2"
+RDS_DB_INSTANCE_ID="df-instancia-01"
+EC2_INSTANCE_ID="i-0502108d733ea74c3"
+AWS_INTENTOS=2
+
+###############################################################################
+# Umbrales CloudWatch RDS
+###############################################################################
+
+# CPU promedio alta.
+UMBRAL_RDS_CPU_PCT=80
+
+# db.t3.medium tiene 4 GiB de RAM. Para este servidor comenzamos alertando
+# por debajo de 512 MB sostenidos y ajustaremos con el histórico real.
+UMBRAL_RDS_MEMORIA_LIBRE_MB=512
+
+# SwapUsage en MB. 0 deshabilita esta alerta.
+# Un poco de swap no implica por sí solo presión crítica; se correlaciona con
+# FreeableMemory y se exige que la condición sea sostenida.
+UMBRAL_RDS_SWAP_MB=256
+
+# CPUCreditBalance en créditos (vCPU-minuto). Solo aplica a RDS burstable
+# (db.t2/db.t3/db.t4g). 0 deshabilita esta alerta.
+UMBRAL_RDS_CPU_CREDIT_BALANCE=50
+
+# BurstBalance: porcentaje de créditos de I/O gp2 disponibles.
+# 0 deshabilita esta alerta.
+UMBRAL_RDS_BURST_BALANCE_PCT=20
+
+# 0 = deshabilitar este umbral; MySQL ya se controla por % de max_connections.
+UMBRAL_RDS_CONEXIONES=0
+
+# Duración mínima de la anomalía antes de alertar.
+TIEMPO_SOSTENIDO_RDS=300
