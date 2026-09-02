@@ -479,11 +479,15 @@ procesar_categoria_log_apache() {
     local ruta_log="$8"
     local evento_log="$9"
     local sitio_clave
-    local archivo_contador muestra_errores="" detalles_pushover=""
-    local ocurrencias_nuevas=0 ocurrencias_acumuladas=0 ultima_alerta=0 ahora
+    local archivo_contador muestra_errores="" detalles_pushover="" muestras_bloqueadas=""
+    local ocurrencias_nuevas=0 ocurrencias_bloqueadas=0 ocurrencias_acumuladas=0 ultima_alerta=0 ahora
 
     sitio_clave="$(printf '%s' "$sitio" | sed 's/[^[:alnum:]_-]/_/g')"
-    archivo_contador="${DIRECTORIO_ESTADO}/apache_${sitio_clave}_${clave}.contador"
+    if [[ "$clave" == "seguridad" ]]; then
+        archivo_contador="${DIRECTORIO_ESTADO}/apache_${sitio_clave}_${clave}_accionable.contador"
+    else
+        archivo_contador="${DIRECTORIO_ESTADO}/apache_${sitio_clave}_${clave}.contador"
+    fi
 
     if ! booleano_habilitado "$habilitado"; then
         rm -f "$archivo_contador"
@@ -500,13 +504,37 @@ procesar_categoria_log_apache() {
         return 0
     fi
 
-    ocurrencias_nuevas="$(grep -Eic -- "$regex" "$archivo_nuevas" || true)"
-    ocurrencias_nuevas="${ocurrencias_nuevas:-0}"
+    if [[ "$clave" == "seguridad" ]]; then
+        ocurrencias_bloqueadas="$(grep -Eic -- 'client denied by server configuration' "$archivo_nuevas" || true)"
+        ocurrencias_bloqueadas="${ocurrencias_bloqueadas:-0}"
+        ocurrencias_nuevas="$(grep -Ei -- "$regex" "$archivo_nuevas" \
+            | grep -Eiv -- 'client denied by server configuration' \
+            | wc -l || true)"
+        ocurrencias_nuevas="${ocurrencias_nuevas//[[:space:]]/}"
+        ocurrencias_nuevas="${ocurrencias_nuevas:-0}"
+
+        if (( ocurrencias_bloqueadas > 0 )); then
+            muestras_bloqueadas="$(grep -Ei -- 'client denied by server configuration' "$archivo_nuevas" \
+                | head -n 3 \
+                | awk '{gsub(/[[:space:]]+/, " "); printf "%s%s", (NR > 1 ? " || " : ""), substr($0, 1, 500)}')"
+            registrar "WARN" "$evento_log" "sitio=${sitio} categoria=seguridad_bloqueada ocurrencias_nuevas=${ocurrencias_bloqueadas} pushover=omitido muestras=${muestras_bloqueadas}"
+        fi
+    else
+        ocurrencias_nuevas="$(grep -Eic -- "$regex" "$archivo_nuevas" || true)"
+        ocurrencias_nuevas="${ocurrencias_nuevas:-0}"
+    fi
 
     if (( ocurrencias_nuevas > 0 )); then
-        muestra_errores="$(grep -Ei -- "$regex" "$archivo_nuevas" \
-            | head -n 3 \
-            | awk '{gsub(/[[:space:]]+/, " "); printf "%s%s", (NR > 1 ? " || " : ""), substr($0, 1, 500)}')"
+        if [[ "$clave" == "seguridad" ]]; then
+            muestra_errores="$(grep -Ei -- "$regex" "$archivo_nuevas" \
+                | grep -Eiv -- 'client denied by server configuration' \
+                | head -n 3 \
+                | awk '{gsub(/[[:space:]]+/, " "); printf "%s%s", (NR > 1 ? " || " : ""), substr($0, 1, 500)}')"
+        else
+            muestra_errores="$(grep -Ei -- "$regex" "$archivo_nuevas" \
+                | head -n 3 \
+                | awk '{gsub(/[[:space:]]+/, " "); printf "%s%s", (NR > 1 ? " || " : ""), substr($0, 1, 500)}')"
+        fi
     fi
 
     if [[ -r "$archivo_contador" ]]; then
