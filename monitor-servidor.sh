@@ -61,6 +61,33 @@ TIEMPO_SOSTENIDO_CPU="${TIEMPO_SOSTENIDO_CPU:-300}"
 UMBRAL_MEMORIA_SISTEMA_PCT="${UMBRAL_MEMORIA_SISTEMA_PCT:-90}"
 TIEMPO_SOSTENIDO_MEMORIA="${TIEMPO_SOSTENIDO_MEMORIA:-120}"
 
+# Disco y crecimiento de directorios.
+CHECK_ESPACIO_DISCO="${CHECK_ESPACIO_DISCO:-true}"
+UMBRAL_DISCO_USO_PCT="${UMBRAL_DISCO_USO_PCT:-85}"
+UMBRAL_DISCO_INODOS_PCT="${UMBRAL_DISCO_INODOS_PCT:-90}"
+TIEMPO_SOSTENIDO_DISCO="${TIEMPO_SOSTENIDO_DISCO:-120}"
+if ! declare -p RUTAS_DISCO_MONITOREADAS >/dev/null 2>&1; then
+    RUTAS_DISCO_MONITOREADAS=("/" "/var/log" "/var/lib" "/var/cache" "/ztrabajo/www" "/home" "/tmp")
+fi
+CHECK_CRECIMIENTO_DIRECTORIOS="${CHECK_CRECIMIENTO_DIRECTORIOS:-true}"
+DIRECTORIO_SNAPSHOTS_DIRECTORIOS="${DIRECTORIO_SNAPSHOTS_DIRECTORIOS:-${DIRECTORIO_ESTADO}/snapshots-directorios}"
+INTERVALO_SNAPSHOT_DIRECTORIOS="${INTERVALO_SNAPSHOT_DIRECTORIOS:-1800}"
+VENTANA_CRECIMIENTO_DIRECTORIOS="${VENTANA_CRECIMIENTO_DIRECTORIOS:-86400}"
+TOLERANCIA_SNAPSHOT_DIRECTORIOS="${TOLERANCIA_SNAPSHOT_DIRECTORIOS:-3600}"
+RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS="${RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS:-7}"
+SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO="${SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO:-86400}"
+TIMEOUT_DU_DIRECTORIO="${TIMEOUT_DU_DIRECTORIO:-120}"
+if ! declare -p RUTAS_CRECIMIENTO_DIRECTORIOS >/dev/null 2>&1; then
+    RUTAS_CRECIMIENTO_DIRECTORIOS=(
+        "/var/log|20|512"
+        "/var/lib|20|1024"
+        "/var/cache|50|512"
+        "/ztrabajo/www|20|1024"
+        "/home|20|1024"
+        "/tmp|100|512"
+    )
+fi
+
 # Apache.
 APACHE_SERVICIO="${APACHE_SERVICIO:-apache2}"
 APACHE_PROCESO="${APACHE_PROCESO:-apache2}"
@@ -406,6 +433,297 @@ monitorear_sistema() {
         "Memoria utilizada ${memoria_pct}% >= ${UMBRAL_MEMORIA_SISTEMA_PCT}%." \
         1 \
         "Memoria normalizada en ${NOMBRE_SERVIDOR}: ${memoria_pct}% utilizada."
+}
+
+# Supervisa el porcentaje de espacio e inodos utilizados en los filesystems que
+# contienen las rutas configuradas. Si varias rutas pertenecen al mismo punto de
+# montaje, se revisa una sola vez para evitar alertas duplicadas.
+monitorear_espacio_disco() {
+    local ruta datos filesystem total_kb usado_kb disponible_kb uso_pct montaje
+    local datos_inodos inodos_total inodos_usados inodos_disponibles inodos_pct
+    local total_mb usado_mb disponible_mb clave condicion_espacio condicion_inodos
+    local -A montajes_vistos=()
+
+    if ! booleano_habilitado "$CHECK_ESPACIO_DISCO"; then
+        return 0
+    fi
+
+    for ruta in "${RUTAS_DISCO_MONITOREADAS[@]}"; do
+        if [[ ! -e "$ruta" ]]; then
+            registrar "WARN" "disco" "ruta=${ruta} estado=no_existe"
+            continue
+        fi
+
+        datos="$(df -k --output=source,size,used,avail,pcent,target -- "$ruta" 2>/dev/null | tail -n 1)"
+        if [[ -z "$datos" ]]; then
+            registrar "WARN" "disco" "ruta=${ruta} estado=df_sin_datos"
+            continue
+        fi
+
+        read -r filesystem total_kb usado_kb disponible_kb uso_pct montaje <<< "$datos"
+        uso_pct="${uso_pct%%%}"
+
+        if [[ -z "$filesystem" || -z "$montaje" || ! "$total_kb" =~ ^[0-9]+$ || ! "$uso_pct" =~ ^[0-9]+$ ]]; then
+            registrar "WARN" "disco" "ruta=${ruta} estado=df_datos_invalidos"
+            continue
+        fi
+
+        if [[ -n "${montajes_vistos[$montaje]:-}" ]]; then
+            continue
+        fi
+        montajes_vistos["$montaje"]=1
+
+        datos_inodos="$(df --output=itotal,iused,iavail,ipcent -- "$ruta" 2>/dev/null | tail -n 1)"
+        read -r inodos_total inodos_usados inodos_disponibles inodos_pct <<< "$datos_inodos"
+        inodos_pct="${inodos_pct%%%}"
+        if [[ ! "$inodos_pct" =~ ^[0-9]+$ ]]; then
+            inodos_pct=0
+        fi
+
+        total_mb="$(awk -v kb="$total_kb" 'BEGIN {printf "%.2f", kb/1024}')"
+        usado_mb="$(awk -v kb="$usado_kb" 'BEGIN {printf "%.2f", kb/1024}')"
+        disponible_mb="$(awk -v kb="$disponible_kb" 'BEGIN {printf "%.2f", kb/1024}')"
+
+        registrar "INFO" "disco" "filesystem=${filesystem} montaje=${montaje} total_mb=${total_mb} usado_mb=${usado_mb} disponible_mb=${disponible_mb} uso_pct=${uso_pct} inodos_uso_pct=${inodos_pct}"
+
+        clave="$(printf '%s' "$montaje" | cksum | awk '{print $1}')"
+        condicion_espacio=0
+        condicion_inodos=0
+
+        if (( uso_pct >= UMBRAL_DISCO_USO_PCT )); then
+            condicion_espacio=1
+        fi
+        if (( inodos_pct >= UMBRAL_DISCO_INODOS_PCT )); then
+            condicion_inodos=1
+        fi
+
+        gestionar_alerta \
+            "disco_espacio_${clave}" \
+            "$condicion_espacio" \
+            "$TIEMPO_SOSTENIDO_DISCO" \
+            "Espacio en disco alto - ${NOMBRE_SERVIDOR}" \
+            "Filesystem ${filesystem}, montaje ${montaje}: uso ${uso_pct}% >= ${UMBRAL_DISCO_USO_PCT}%. Usado ${usado_mb} MB, disponible ${disponible_mb} MB." \
+            1 \
+            "Espacio normalizado en ${NOMBRE_SERVIDOR}: ${montaje} está en ${uso_pct}% de uso."
+
+        gestionar_alerta \
+            "disco_inodos_${clave}" \
+            "$condicion_inodos" \
+            "$TIEMPO_SOSTENIDO_DISCO" \
+            "Inodos en disco altos - ${NOMBRE_SERVIDOR}" \
+            "Filesystem ${filesystem}, montaje ${montaje}: inodos utilizados ${inodos_pct}% >= ${UMBRAL_DISCO_INODOS_PCT}%." \
+            1 \
+            "Inodos normalizados en ${NOMBRE_SERVIDOR}: ${montaje} está en ${inodos_pct}% de uso."
+    done
+}
+
+# Ejecuta du con baja prioridad de CPU e I/O cuando las herramientas están
+# disponibles. Devuelve la salida de du y conserva su código de retorno.
+medir_tamanio_directorio_kb() {
+    local ruta="$1"
+    local -a comando=(nice -n 19 du -skx -- "$ruta")
+
+    if command -v ionice >/dev/null 2>&1; then
+        comando=(ionice -c3 "${comando[@]}")
+    fi
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$TIMEOUT_DU_DIRECTORIO" "${comando[@]}"
+        return $?
+    fi
+
+    "${comando[@]}"
+}
+
+# Busca el snapshot cuyo timestamp esté más cerca del objetivo configurado,
+# aceptándolo únicamente dentro de la tolerancia indicada.
+buscar_snapshot_referencia_directorios() {
+    local ahora="$1"
+    local objetivo archivo nombre timestamp diferencia mejor_diferencia mejor=""
+
+    objetivo=$((ahora - VENTANA_CRECIMIENTO_DIRECTORIOS))
+    mejor_diferencia=$((TOLERANCIA_SNAPSHOT_DIRECTORIOS + 1))
+
+    for archivo in "$DIRECTORIO_SNAPSHOTS_DIRECTORIOS"/*.snapshot; do
+        [[ -f "$archivo" ]] || continue
+        nombre="$(basename "$archivo" .snapshot)"
+        [[ "$nombre" =~ ^[0-9]+$ ]] || continue
+        timestamp="$nombre"
+
+        diferencia=$((timestamp - objetivo))
+        (( diferencia < 0 )) && diferencia=$((-diferencia))
+
+        if (( diferencia <= TOLERANCIA_SNAPSHOT_DIRECTORIOS && diferencia < mejor_diferencia )); then
+            mejor="$archivo"
+            mejor_diferencia="$diferencia"
+        fi
+    done
+
+    printf '%s\n' "$mejor"
+}
+
+# Envía como máximo una alerta por ruta durante el cooldown específico del
+# crecimiento de directorios. Devuelve el estado para dejarlo en monitor.log.
+alertar_crecimiento_directorio() {
+    local ruta="$1"
+    local mensaje="$2"
+    local clave archivo_estado ahora ultima_alerta=0
+
+    clave="$(printf '%s' "$ruta" | cksum | awk '{print $1}')"
+    archivo_estado="${DIRECTORIO_ESTADO}/crecimiento_directorio_${clave}.estado"
+    ahora="$(date +%s)"
+
+    if [[ -r "$archivo_estado" ]]; then
+        read -r ultima_alerta < "$archivo_estado" || true
+        ultima_alerta="${ultima_alerta:-0}"
+    fi
+
+    if (( ultima_alerta > 0 && ahora - ultima_alerta < SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO )); then
+        printf 'cooldown\n'
+        return 0
+    fi
+
+    if enviar_pushover "Crecimiento de directorio - ${NOMBRE_SERVIDOR}" "$mensaje" 1; then
+        printf '%s\n' "$ahora" > "$archivo_estado"
+        printf 'enviado\n'
+        return 0
+    fi
+
+    printf 'error\n'
+}
+
+# Toma snapshots de tamaño con la frecuencia configurada y compara cada ruta
+# contra el snapshot más cercano a la ventana histórica definida.
+monitorear_crecimiento_directorios() {
+    local archivo_ultimo="${DIRECTORIO_ESTADO}/crecimiento_directorios_ultimo_snapshot.estado"
+    local ahora ultimo_snapshot=0 snapshot_nuevo snapshot_temporal snapshot_referencia referencia_ts="0"
+    local entrada ruta umbral_pct umbral_mb salida estado_du kb_actual kb_anterior=""
+    local actual_mb anterior_mb delta_kb delta_mb crecimiento_pct pushover condicion nivel
+    local mediciones_validas=0
+
+    if ! booleano_habilitado "$CHECK_CRECIMIENTO_DIRECTORIOS"; then
+        return 0
+    fi
+
+    ahora="$(date +%s)"
+    if [[ -r "$archivo_ultimo" ]]; then
+        read -r ultimo_snapshot < "$archivo_ultimo" || true
+        ultimo_snapshot="${ultimo_snapshot:-0}"
+    fi
+
+    if (( ultimo_snapshot > 0 && ahora - ultimo_snapshot < INTERVALO_SNAPSHOT_DIRECTORIOS )); then
+        return 0
+    fi
+
+    mkdir -p "$DIRECTORIO_SNAPSHOTS_DIRECTORIOS" 2>/dev/null || {
+        registrar "ERROR" "crecimiento_directorio" "estado=no_se_puede_crear_directorio_snapshots ruta=${DIRECTORIO_SNAPSHOTS_DIRECTORIOS}"
+        return 1
+    }
+
+    snapshot_referencia="$(buscar_snapshot_referencia_directorios "$ahora")"
+    if [[ -n "$snapshot_referencia" ]]; then
+        referencia_ts="$(basename "$snapshot_referencia" .snapshot)"
+    fi
+
+    snapshot_nuevo="${DIRECTORIO_SNAPSHOTS_DIRECTORIOS}/${ahora}.snapshot"
+    snapshot_temporal="${snapshot_nuevo}.tmp.$$"
+    : > "$snapshot_temporal" || {
+        registrar "ERROR" "crecimiento_directorio" "estado=no_se_puede_crear_snapshot ruta=${snapshot_temporal}"
+        return 1
+    }
+
+    for entrada in "${RUTAS_CRECIMIENTO_DIRECTORIOS[@]}"; do
+        IFS='|' read -r ruta umbral_pct umbral_mb <<< "$entrada"
+
+        if [[ -z "$ruta" || ! "$umbral_pct" =~ ^[0-9]+([.][0-9]+)?$ || ! "$umbral_mb" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+            registrar "WARN" "crecimiento_directorio" "configuracion_invalida=${entrada}"
+            continue
+        fi
+
+        if [[ ! -d "$ruta" ]]; then
+            registrar "WARN" "crecimiento_directorio" "ruta=${ruta} estado=no_existe"
+            continue
+        fi
+
+        salida="$(medir_tamanio_directorio_kb "$ruta" 2>/dev/null)"
+        estado_du=$?
+        if (( estado_du != 0 )); then
+            if (( estado_du == 124 )); then
+                registrar "WARN" "crecimiento_directorio" "ruta=${ruta} estado=timeout timeout_s=${TIMEOUT_DU_DIRECTORIO}"
+            else
+                registrar "WARN" "crecimiento_directorio" "ruta=${ruta} estado=du_error codigo=${estado_du}"
+            fi
+            continue
+        fi
+
+        kb_actual="$(printf '%s\n' "$salida" | awk 'NR==1 {print $1}')"
+        if [[ ! "$kb_actual" =~ ^[0-9]+$ ]]; then
+            registrar "WARN" "crecimiento_directorio" "ruta=${ruta} estado=du_datos_invalidos"
+            continue
+        fi
+
+        printf '%s\t%s\n' "$kb_actual" "$ruta" >> "$snapshot_temporal"
+        mediciones_validas=$((mediciones_validas + 1))
+        actual_mb="$(awk -v kb="$kb_actual" 'BEGIN {printf "%.2f", kb/1024}')"
+        kb_anterior=""
+
+        if [[ -n "$snapshot_referencia" && -r "$snapshot_referencia" ]]; then
+            kb_anterior="$(awk -F '\t' -v ruta="$ruta" '$2 == ruta {print $1; exit}' "$snapshot_referencia")"
+        fi
+
+        if [[ ! "$kb_anterior" =~ ^[0-9]+$ ]]; then
+            registrar "INFO" "crecimiento_directorio" "ruta=${ruta} tamanio_actual_mb=${actual_mb} referencia=sin_snapshot_comparable snapshot_ts=${ahora}"
+            continue
+        fi
+
+        anterior_mb="$(awk -v kb="$kb_anterior" 'BEGIN {printf "%.2f", kb/1024}')"
+        if (( kb_actual > kb_anterior )); then
+            delta_kb=$((kb_actual - kb_anterior))
+        else
+            delta_kb=0
+        fi
+        delta_mb="$(awk -v kb="$delta_kb" 'BEGIN {printf "%.2f", kb/1024}')"
+        crecimiento_pct="$(awk -v nuevo="$kb_actual" -v viejo="$kb_anterior" 'BEGIN {
+            if (viejo <= 0) {
+                if (nuevo > 0) printf "100.00"; else printf "0.00"
+            } else if (nuevo <= viejo) {
+                printf "0.00"
+            } else {
+                printf "%.2f", ((nuevo - viejo) * 100) / viejo
+            }
+        }')"
+
+        condicion=0
+        if mayor_igual "$delta_mb" "$umbral_mb" && mayor_igual "$crecimiento_pct" "$umbral_pct"; then
+            condicion=1
+        fi
+
+        pushover="omitido"
+        nivel="INFO"
+        if (( condicion == 1 )); then
+            nivel="WARN"
+            pushover="$(alertar_crecimiento_directorio \
+                "$ruta" \
+                "Ruta: ${ruta}. Tamaño anterior: ${anterior_mb} MB. Tamaño actual: ${actual_mb} MB. Crecimiento: ${delta_mb} MB (${crecimiento_pct}%). Ventana aproximada: ${VENTANA_CRECIMIENTO_DIRECTORIOS}s. Umbral: ${umbral_mb} MB y ${umbral_pct}%.")"
+        fi
+
+        registrar "$nivel" "crecimiento_directorio" "ruta=${ruta} tamanio_anterior_mb=${anterior_mb} tamanio_actual_mb=${actual_mb} delta_mb=${delta_mb} crecimiento_pct=${crecimiento_pct} ventana_s=${VENTANA_CRECIMIENTO_DIRECTORIOS} referencia_ts=${referencia_ts} snapshot_ts=${ahora} umbral_mb=${umbral_mb} umbral_pct=${umbral_pct} pushover=${pushover}"
+    done
+
+    if (( mediciones_validas == 0 )); then
+        rm -f "$snapshot_temporal"
+        registrar "WARN" "crecimiento_directorio" "estado=sin_mediciones_validas snapshot_ts=${ahora}"
+        return 1
+    fi
+
+    mv -f "$snapshot_temporal" "$snapshot_nuevo" || {
+        rm -f "$snapshot_temporal"
+        registrar "ERROR" "crecimiento_directorio" "estado=no_se_puede_finalizar_snapshot ruta=${snapshot_nuevo}"
+        return 1
+    }
+
+    printf '%s\n' "$ahora" > "$archivo_ultimo"
+    find "$DIRECTORIO_SNAPSHOTS_DIRECTORIOS" -type f -name '*.snapshot' -mtime "+${RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS}" -delete 2>/dev/null || true
 }
 
 ###############################################################################
@@ -1708,6 +2026,8 @@ ejecutar_revision() {
     registrar "INFO" "monitor" "inicio_revision"
 
     monitorear_sistema
+    monitorear_espacio_disco
+    monitorear_crecimiento_directorios
     monitorear_apache
     analyze_logs
     monitorear_mysql

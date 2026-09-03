@@ -6,8 +6,8 @@
 # Pushover
 ###############################################################################
 
-USER_KEY="xxx"
-API_TOKEN="xxx"
+USER_KEY="utxzw23h2u8kf3hf1z82bmiss2r3pi"
+API_TOKEN="au2yvfwtn94wku7io4jigozgdxb4eu"
 PUSHOVER_HABILITADO=1
 
 # Repite una alerta todavía activa como máximo cada 30 minutos.
@@ -36,6 +36,55 @@ SEGUNDOS_MUESTRA_CPU=2
 # RAM usada >= 90% por 2 minutos.
 UMBRAL_MEMORIA_SISTEMA_PCT=90
 TIEMPO_SOSTENIDO_MEMORIA=120
+
+###############################################################################
+# Disco y crecimiento de directorios
+###############################################################################
+
+CHECK_ESPACIO_DISCO=true
+
+# Filesystems que contienen estas rutas. Si varias rutas pertenecen al mismo
+# punto de montaje, el monitor lo revisa una sola vez.
+RUTAS_DISCO_MONITOREADAS=(
+    "/"
+    "/var/log"
+    "/var/lib"
+    "/var/cache"
+    "/ztrabajo/www"
+    "/home"
+    "/tmp"
+)
+
+# Alertar por uso de espacio o inodos sostenido durante 2 minutos.
+UMBRAL_DISCO_USO_PCT=85
+UMBRAL_DISCO_INODOS_PCT=90
+TIEMPO_SOSTENIDO_DISCO=120
+
+CHECK_CRECIMIENTO_DIRECTORIOS=true
+DIRECTORIO_SNAPSHOTS_DIRECTORIOS="${DIRECTORIO_ESTADO}/snapshots-directorios"
+
+# Los snapshots se toman cada 30 minutos y se comparan contra el snapshot más
+# cercano a 24 horas atrás, con una tolerancia máxima de +/- 1 hora.
+INTERVALO_SNAPSHOT_DIRECTORIOS=1800
+VENTANA_CRECIMIENTO_DIRECTORIOS=86400
+TOLERANCIA_SNAPSHOT_DIRECTORIOS=3600
+RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS=7
+TIMEOUT_DU_DIRECTORIO=120
+
+# Una misma ruta genera como máximo una alerta de crecimiento cada 24 horas.
+SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO=86400
+
+# Formato: ruta|crecimiento_porcentual|minimo_absoluto_mb
+# Deben cumplirse simultáneamente el porcentaje y el mínimo absoluto para
+# generar una alerta PushOver.
+RUTAS_CRECIMIENTO_DIRECTORIOS=(
+    "/var/log|20|512"
+    "/var/lib|20|1024"
+    "/var/cache|50|512"
+    "/ztrabajo/www|20|1024"
+    "/home|20|1024"
+    "/tmp|100|512"
+)
 
 ###############################################################################
 # Apache prefork
