@@ -253,6 +253,9 @@ Ahí se almacenan, entre otros:
 - contadores Apache por sitio y categoría;
 - cursores de `error.log` y `access.log`;
 - contador anterior de `Slow_queries` de MySQL;
+- cursor de lectura del Slow Query Log en CloudWatch;
+- `eventId` recientes de slow queries para evitar reprocesamiento;
+- estado por fingerprint de slow queries, incluyendo repeticiones y cooldown;
 - lock de ejecución.
 
 No elimine este directorio durante la operación normal. Hacerlo reinicia la memoria persistente del monitor.
@@ -383,7 +386,89 @@ max_connections
 long_query_time
 ```
 
-`Slow_queries` es acumulativo; el monitor conserva el valor anterior y calcula la tasa aproximada de nuevas slow queries por minuto.
+`Slow_queries` es acumulativo; el monitor conserva el valor anterior y calcula la tasa aproximada de nuevas slow queries por minuto. Esta supervisión agregada existente se mantiene independiente del análisis detallado descrito a continuación.
+
+### Detalle de Slow Query Log
+
+Además del contador agregado anterior, el monitor puede leer las entradas reales del Slow Query Log de RDS exportadas a CloudWatch Logs. Esta función se habilita con:
+
+```bash
+CHECK_MYSQL_SLOW_QUERY_DETAILS=true
+```
+
+Para utilizarla, MariaDB/RDS debe tener habilitado el Slow Query Log con salida a archivo y la exportación `slowquery` hacia CloudWatch Logs. Para la configuración actual se espera conceptualmente:
+
+```text
+log_output=FILE
+log_slow_query=ON
+slow_query_log=ON
+log_slow_query_time=2.000000
+long_query_time=2.000000
+```
+
+y el log group:
+
+```text
+/aws/rds/instance/df-instancia-01/slowquery
+```
+
+La configuración utilizada por el monitor es:
+
+```bash
+MYSQL_SLOW_QUERY_LOG_GROUP="/aws/rds/instance/df-instancia-01/slowquery"
+UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS=5
+UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS=15
+UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES=3
+VENTANA_MYSQL_SLOW_QUERY_REPETICIONES=600
+SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
+MYSQL_SLOW_QUERY_USUARIOS_BACKUP="backup_user"
+UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS=120
+MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS=700
+MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS=3600
+```
+
+Para usuarios normales se aplican estas reglas:
+
+- una consulta inferior a 5 segundos queda registrada, pero no suma para la alerta por repetición;
+- una misma query lógica entre 5 y menos de 15 segundos alerta al alcanzar 3 ocurrencias dentro de 10 minutos;
+- una consulta de 15 segundos o más puede alertar desde la primera ocurrencia;
+- la misma query lógica puede enviar como máximo un Pushover por hora.
+
+Los usuarios indicados en `MYSQL_SLOW_QUERY_USUARIOS_BACKUP`, actualmente `backup_user`, tienen tratamiento especial: todas sus slow queries se registran, pero solamente generan Pushover si alcanzan 120 segundos o más.
+
+El monitor extrae de cada entrada, cuando están disponibles:
+
+```text
+timestamp
+usuario
+host/IP
+base de datos
+Query_time
+Lock_time
+Rows_sent
+Rows_examined
+SQL
+```
+
+El SQL se normaliza para generar un fingerprint. Literales de texto y valores numéricos se sustituyen conceptualmente por marcadores antes de calcular el hash, por lo que consultas equivalentes con IDs o valores diferentes pueden compartir el mismo estado de repetición y cooldown.
+
+El SQL completo procesado se registra en `monitor.log`. Pushover recibe como máximo `MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS` caracteres del SQL para limitar el tamaño de la notificación.
+
+### Lectura incremental de CloudWatch Logs
+
+La primera vez que se habilita esta función, el monitor inicializa el cursor en el momento actual y **no procesa el historial anterior**. En las siguientes ejecuciones reconsulta una ventana anterior de una hora para absorber posibles retrasos de ingestión desde RDS.
+
+Cada entrada de CloudWatch se identifica mediante su `eventId`. Los IDs ya procesados se conservan temporalmente en el estado persistente, por lo que el solapamiento no hace que la misma slow query se registre o alerte repetidamente.
+
+Prueba manual del log group actual:
+
+```bash
+sudo -H aws logs filter-log-events \
+    --log-group-name "/aws/rds/instance/df-instancia-01/slowquery" \
+    --limit 10 \
+    --profile agente-control-monitoring \
+    --region us-east-2
+```
 
 ---
 
@@ -430,6 +515,7 @@ El código invoca estas operaciones:
 cloudwatch:GetMetricStatistics
 rds:DescribeDBInstances
 ec2:DescribeInstanceStatus
+logs:FilterLogEvents
 ```
 
 Una política de referencia es:
@@ -446,6 +532,13 @@ Una política de referencia es:
         "ec2:DescribeInstanceStatus"
       ],
       "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "arn:aws:logs:us-east-2:ID_CUENTA:log-group:/aws/rds/instance/df-instancia-01/slowquery"
     }
   ]
 }
@@ -515,6 +608,14 @@ SEGUNDOS_COOLDOWN_ALERTA=1800
 por lo que una condición todavía activa no debe bombardear Pushover cada minuto.
 
 Para errores Apache, las ocurrencias se acumulan por sitio y categoría. La alerta requiere que en la ejecución actual exista al menos una ocurrencia nueva y que el acumulado haya alcanzado el threshold.
+
+Las slow queries detalladas utilizan un cooldown independiente:
+
+```bash
+SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
+```
+
+Este cooldown se aplica por fingerprint, por lo que una query lógica ya alertada no vuelve a enviar Pushover durante una hora aunque reaparezca. Otras queries con fingerprint diferente pueden alertar de forma independiente.
 
 ---
 
@@ -611,6 +712,20 @@ Si utiliza perfil:
 sudo aws --profile nombre-del-perfil --region us-east-2 sts get-caller-identity
 ```
 
+### `mysql_slow_query` con `cloudwatch=no_disponible`
+
+Compruebe directamente el acceso al Slow Query Log:
+
+```bash
+sudo -H aws logs filter-log-events \
+    --log-group-name "/aws/rds/instance/df-instancia-01/slowquery" \
+    --limit 1 \
+    --profile agente-control-monitoring \
+    --region us-east-2
+```
+
+El principal permiso requerido por el monitor para esta función es `logs:FilterLogEvents` sobre ese log group.
+
 ### El CRON parece no ejecutar
 
 Compruebe:
@@ -687,6 +802,9 @@ Mantenga al menos:
 ```text
 /etc/monitor-servidor/monitor-servidor.conf 0600 root:root
 /etc/monitor-servidor/mysql.cnf             0600 root:root
+/var/log/monitor-servidor/monitor.log       0600 root:root
 ```
+
+El monitoreo detallado de slow queries registra el SQL completo en `monitor.log`. Una consulta puede contener datos de aplicación o literales sensibles, por lo que ese archivo debe tratarse como información protegida y no debe publicarse ni copiarse a ubicaciones de acceso amplio.
 
 Si un archivo de configuración con credenciales reales fue compartido fuera del entorno controlado, rote esas credenciales.

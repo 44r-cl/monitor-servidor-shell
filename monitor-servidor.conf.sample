@@ -6,8 +6,8 @@
 # Pushover
 ###############################################################################
 
-USER_KEY="user-key-aquí"
-API_TOKEN="api-token-aqui"
+USER_KEY="xxx"
+API_TOKEN="xxx"
 PUSHOVER_HABILITADO=1
 
 # Repite una alerta todavía activa como máximo cada 30 minutos.
@@ -110,6 +110,32 @@ UMBRAL_MYSQL_SLOW_POR_MINUTO=10
 
 # Tiempo sostenido para conexiones/threads/slow queries.
 TIEMPO_SOSTENIDO_MYSQL=120
+
+# Detalle de slow queries desde el Slow Query Log de RDS exportado a CloudWatch.
+CHECK_MYSQL_SLOW_QUERY_DETAILS=true
+MYSQL_SLOW_QUERY_LOG_GROUP="/aws/rds/instance/df-instancia-01/slowquery"
+
+# Queries de aplicación entre 5 y menos de 15 segundos se acumulan por fingerprint.
+# Tres ocurrencias dentro de 10 minutos generan alerta. Desde 15 segundos,
+# una sola ocurrencia puede alertar inmediatamente.
+UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS=5
+UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS=15
+UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES=3
+VENTANA_MYSQL_SLOW_QUERY_REPETICIONES=600
+
+# La misma query lógica puede generar como máximo una alerta por hora.
+SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
+
+# Los usuarios de backup se registran siempre, pero solo alertan por duración.
+MYSQL_SLOW_QUERY_USUARIOS_BACKUP="backup_user"
+UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS=120
+
+# SQL máximo incluido en Pushover. El SQL completo permanece en monitor.log.
+MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS=700
+
+# Reconsulta una ventana anterior para absorber retrasos de ingestión de RDS.
+# Los eventId persistentes evitan procesar dos veces la misma entrada.
+MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS=3600
 
 ###############################################################################
 # AWS CLI / CloudWatch

@@ -105,6 +105,19 @@ AWS_REGION="${AWS_REGION:-}"
 RDS_DB_INSTANCE_ID="${RDS_DB_INSTANCE_ID:-}"
 EC2_INSTANCE_ID="${EC2_INSTANCE_ID:-}"
 AWS_INTENTOS="${AWS_INTENTOS:-2}"
+
+# Detalle de slow queries desde el Slow Query Log de RDS exportado a CloudWatch Logs.
+CHECK_MYSQL_SLOW_QUERY_DETAILS="${CHECK_MYSQL_SLOW_QUERY_DETAILS:-false}"
+MYSQL_SLOW_QUERY_LOG_GROUP="${MYSQL_SLOW_QUERY_LOG_GROUP:-}"
+UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS="${UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS:-5}"
+UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS="${UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS:-15}"
+UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES="${UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES:-3}"
+VENTANA_MYSQL_SLOW_QUERY_REPETICIONES="${VENTANA_MYSQL_SLOW_QUERY_REPETICIONES:-600}"
+SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY="${SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY:-3600}"
+MYSQL_SLOW_QUERY_USUARIOS_BACKUP="${MYSQL_SLOW_QUERY_USUARIOS_BACKUP:-backup_user}"
+UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS="${UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS:-120}"
+MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS="${MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS:-700}"
+MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS="${MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS:-3600}"
 UMBRAL_RDS_CPU_PCT="${UMBRAL_RDS_CPU_PCT:-80}"
 UMBRAL_RDS_MEMORIA_LIBRE_MB="${UMBRAL_RDS_MEMORIA_LIBRE_MB:-1024}"
 UMBRAL_RDS_SWAP_MB="${UMBRAL_RDS_SWAP_MB:-512}"
@@ -1008,6 +1021,412 @@ ejecutar_aws() {
     return "$codigo"
 }
 
+
+# Devuelve éxito si el usuario indicado está configurado como usuario de backup.
+#
+# Argumentos:
+#   1: usuario MySQL.
+usuario_mysql_slow_es_backup() {
+    local usuario="$1"
+    local configurado
+
+    for configurado in ${MYSQL_SLOW_QUERY_USUARIOS_BACKUP//,/ }; do
+        if [[ "$usuario" == "$configurado" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Devuelve éxito si el eventId de CloudWatch ya fue procesado.
+#
+# Argumentos:
+#   1: eventId de CloudWatch Logs.
+evento_mysql_slow_ya_procesado() {
+    local event_id="$1"
+    local archivo_eventos="${DIRECTORIO_ESTADO}/mysql_slow_query_eventos.estado"
+
+    [[ -r "$archivo_eventos" ]] || return 1
+    awk -F'|' -v id="$event_id" '$2 == id { encontrado=1; exit } END { exit !encontrado }' "$archivo_eventos"
+}
+
+# Registra un eventId de CloudWatch como procesado y conserva solo siete días.
+#
+# Argumentos:
+#   1: eventId de CloudWatch Logs.
+registrar_evento_mysql_slow_procesado() {
+    local event_id="$1"
+    local archivo_eventos="${DIRECTORIO_ESTADO}/mysql_slow_query_eventos.estado"
+    local archivo_temporal="${DIRECTORIO_ESTADO}/mysql_slow_query_eventos.$$.tmp"
+    local ahora limite
+
+    ahora="$(date +%s)"
+    limite=$((ahora - 604800))
+
+    if [[ -r "$archivo_eventos" ]]; then
+        awk -F'|' -v limite="$limite" '$1 ~ /^[0-9]+$/ && $1 >= limite' "$archivo_eventos" > "$archivo_temporal"
+    else
+        : > "$archivo_temporal"
+    fi
+
+    printf '%s|%s\n' "$ahora" "$event_id" >> "$archivo_temporal"
+    mv "$archivo_temporal" "$archivo_eventos"
+}
+
+# Convierte la respuesta JSON de FilterLogEvents a registros delimitados por |
+# y codificados en base64. También extrae los metadatos del slow query log y calcula un
+# fingerprint estable reemplazando literales variables del SQL.
+#
+# Argumentos:
+#   1: archivo JSON devuelto por CloudWatch Logs.
+extraer_eventos_mysql_slow() {
+    local archivo_json="$1"
+
+    python3 - "$archivo_json" <<'PY_SLOW_QUERY'
+import base64
+import datetime
+import hashlib
+import json
+import re
+import sys
+
+
+def b64(valor):
+    if valor is None:
+        valor = ""
+    if not isinstance(valor, str):
+        valor = str(valor)
+    return base64.b64encode(valor.encode("utf-8")).decode("ascii")
+
+
+def extraer_sql(mensaje):
+    lineas = mensaje.splitlines()
+    inicio = None
+
+    for indice, linea in enumerate(lineas):
+        if linea.startswith("SET timestamp="):
+            inicio = indice + 1
+            break
+
+    if inicio is None:
+        for indice, linea in enumerate(lineas):
+            if linea.startswith("use `"):
+                inicio = indice + 1
+                break
+
+    if inicio is None:
+        return ""
+
+    sql = []
+    for linea in lineas[inicio:]:
+        if linea.startswith("# Time:"):
+            break
+        if re.match(r"^Time\s+Id\s+Command\s+Argument", linea):
+            break
+        if linea.startswith("SET timestamp=") or linea.startswith("use `"):
+            continue
+        sql.append(linea)
+
+    return "\n".join(sql).strip()
+
+
+def normalizar_sql(sql):
+    normalizado = re.sub(r"/\*.*?\*/", " ", sql, flags=re.S)
+    normalizado = re.sub(r"'(?:''|\\.|[^'])*'", "?", normalizado)
+    normalizado = re.sub(r'"(?:""|\\.|[^"])*"', "?", normalizado)
+    normalizado = re.sub(r"(?<![A-Za-z0-9_`])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9_`])", "?", normalizado)
+    normalizado = re.sub(r"\s+", " ", normalizado).strip()
+    return normalizado
+
+
+with open(sys.argv[1], "r", encoding="utf-8") as archivo:
+    datos = json.load(archivo)
+
+for evento in datos.get("events", []):
+    mensaje = evento.get("message", "")
+    if "# Query_time:" not in mensaje:
+        continue
+
+    usuario_match = re.search(r"^# User@Host:\s*([^\[]+)\[[^\]]*\]\s*@.*?\[([^\]]*)\]", mensaje, re.M)
+    schema_match = re.search(r"\bSchema:\s*(.*?)\s+QC_hit:", mensaje)
+    query_match = re.search(r"# Query_time:\s*([0-9.]+)\s+Lock_time:\s*([0-9.]+)\s+Rows_sent:\s*([0-9]+)\s+Rows_examined:\s*([0-9]+)", mensaje)
+
+    if not usuario_match or not query_match:
+        continue
+
+    sql = extraer_sql(mensaje)
+    if not sql:
+        continue
+
+    event_id = evento.get("eventId", "")
+    timestamp_ms = int(evento.get("timestamp", 0) or 0)
+    usuario = usuario_match.group(1).strip()
+    host = usuario_match.group(2).strip()
+    schema = schema_match.group(1).strip() if schema_match else ""
+    query_time, lock_time, rows_sent, rows_examined = query_match.groups()
+
+    timestamp_iso = ""
+    if timestamp_ms > 0:
+        timestamp_iso = datetime.datetime.fromtimestamp(
+            timestamp_ms / 1000, datetime.timezone.utc
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+    fingerprint_base = "\0".join((usuario, schema, normalizar_sql(sql)))
+    fingerprint = hashlib.sha256(fingerprint_base.encode("utf-8")).hexdigest()
+
+    campos = [
+        event_id,
+        str(timestamp_ms),
+        timestamp_iso,
+        usuario,
+        host,
+        schema,
+        query_time,
+        lock_time,
+        rows_sent,
+        rows_examined,
+        fingerprint,
+        sql,
+    ]
+    print("|".join(b64(campo) for campo in campos))
+PY_SLOW_QUERY
+}
+
+# Procesa una slow query individual, actualiza su estado por fingerprint y decide
+# si corresponde enviar Pushover según duración, repetición, backup y cooldown.
+#
+# Argumentos:
+#   1: eventId.
+#   2: timestamp en milisegundos.
+#   3: timestamp ISO 8601 UTC.
+#   4: usuario MySQL.
+#   5: host/IP origen.
+#   6: schema/base de datos.
+#   7: Query_time en segundos.
+#   8: Lock_time en segundos.
+#   9: Rows_sent.
+#  10: Rows_examined.
+#  11: fingerprint.
+#  12: SQL completo.
+procesar_evento_mysql_slow() {
+    local event_id="$1"
+    local timestamp_ms="$2"
+    local timestamp_iso="$3"
+    local usuario="$4"
+    local host_mysql="$5"
+    local schema="$6"
+    local duracion="$7"
+    local lock_time="$8"
+    local rows_sent="$9"
+    local rows_examined="${10}"
+    local fingerprint="${11}"
+    local sql="${12}"
+    local archivo_estado="${DIRECTORIO_ESTADO}/mysql_slow_query_${fingerprint}.estado"
+    local ventana_inicio=0 ocurrencias=0 ultima_alerta=0 duracion_maxima="0"
+    local evento_segundos ahora alerta=0 es_backup=0 incrementar_ocurrencias=0 motivo="" pushover_estado="omitido"
+    local sql_pushover titulo mensaje
+
+    if evento_mysql_slow_ya_procesado "$event_id"; then
+        return 0
+    fi
+
+    evento_segundos=$((timestamp_ms / 1000))
+    ahora="$(date +%s)"
+
+    if [[ -r "$archivo_estado" ]]; then
+        IFS='|' read -r ventana_inicio ocurrencias ultima_alerta duracion_maxima < "$archivo_estado" || true
+        ventana_inicio="${ventana_inicio:-0}"
+        ocurrencias="${ocurrencias:-0}"
+        ultima_alerta="${ultima_alerta:-0}"
+        duracion_maxima="${duracion_maxima:-0}"
+    fi
+
+    [[ "$ventana_inicio" =~ ^[0-9]+$ ]] || ventana_inicio=0
+    [[ "$ocurrencias" =~ ^[0-9]+$ ]] || ocurrencias=0
+    [[ "$ultima_alerta" =~ ^[0-9]+$ ]] || ultima_alerta=0
+    es_numero "$duracion_maxima" || duracion_maxima="0"
+
+    if usuario_mysql_slow_es_backup "$usuario"; then
+        es_backup=1
+        incrementar_ocurrencias=1
+    elif mayor_igual "$duracion" "$UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS"; then
+        incrementar_ocurrencias=1
+    fi
+
+    if (( incrementar_ocurrencias == 1 )); then
+        if (( ventana_inicio == 0 || evento_segundos < ventana_inicio || evento_segundos - ventana_inicio > VENTANA_MYSQL_SLOW_QUERY_REPETICIONES )); then
+            ventana_inicio="$evento_segundos"
+            ocurrencias=0
+            duracion_maxima="0"
+        fi
+
+        ocurrencias=$((ocurrencias + 1))
+        if mayor_igual "$duracion" "$duracion_maxima"; then
+            duracion_maxima="$duracion"
+        fi
+    fi
+
+    if (( es_backup == 1 )); then
+        if mayor_igual "$duracion" "$UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS"; then
+            alerta=1
+            motivo="backup_duracion"
+        fi
+    else
+        if mayor_igual "$duracion" "$UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS"; then
+            alerta=1
+            motivo="duracion"
+        elif (( incrementar_ocurrencias == 1 && ocurrencias >= UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES )); then
+            alerta=1
+            motivo="repeticion"
+        fi
+    fi
+
+    if (( alerta == 1 )); then
+        if (( ultima_alerta > 0 && ahora - ultima_alerta < SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY )); then
+            pushover_estado="cooldown"
+        else
+            sql_pushover="$sql"
+            if (( ${#sql_pushover} > MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS )); then
+                sql_pushover="${sql_pushover:0:MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS}…"
+            fi
+
+            if (( es_backup == 1 )); then
+                titulo="Slow Query MySQL Backup - ${NOMBRE_SERVIDOR}"
+            else
+                titulo="Slow Query MySQL - ${NOMBRE_SERVIDOR}"
+            fi
+
+            mensaje="Base=${schema:-desconocida}; usuario=${usuario}; host=${host_mysql:-desconocido}.
+Duración=${duracion}s; lock=${lock_time}s; ocurrencias=${ocurrencias}; rows_examined=${rows_examined}; rows_sent=${rows_sent}.
+Fecha=${timestamp_iso:-desconocida}.
+Motivo=${motivo}.
+SQL:
+${sql_pushover}
+Fingerprint=${fingerprint}"
+
+            if enviar_pushover "$titulo" "$mensaje" 0; then
+                ultima_alerta="$ahora"
+                pushover_estado="enviado"
+            else
+                pushover_estado="fallo"
+            fi
+        fi
+    fi
+
+    registrar "WARN" "mysql_slow_query" "usuario=${usuario} host=${host_mysql:-desconocido} base=${schema:-desconocida} duracion_s=${duracion} lock_s=${lock_time} rows_sent=${rows_sent} rows_examined=${rows_examined} ocurrencias_ventana=${ocurrencias} duracion_maxima_s=${duracion_maxima} backup=${es_backup} pushover=${pushover_estado} motivo=${motivo:-ninguno} fingerprint=${fingerprint} event_id=${event_id} fecha=${timestamp_iso:-desconocida} sql=${sql}"
+
+    printf '%s|%s|%s|%s\n' "$ventana_inicio" "$ocurrencias" "$ultima_alerta" "$duracion_maxima" > "$archivo_estado"
+    registrar_evento_mysql_slow_procesado "$event_id"
+}
+
+# Consulta de forma incremental el Slow Query Log de RDS exportado a CloudWatch
+# Logs. La primera ejecución inicializa el cursor al momento actual para evitar
+# procesar consultas históricas. Las ejecuciones siguientes reconsultan una
+# ventana solapada y deduplican por eventId.
+monitorear_mysql_slow_queries() {
+    local archivo_cursor="${DIRECTORIO_ESTADO}/mysql_slow_query_cloudwatch.cursor"
+    local archivo_json="${DIRECTORIO_ESTADO}/mysql_slow_query_cloudwatch.$$.json"
+    local archivo_eventos="${DIRECTORIO_ESTADO}/mysql_slow_query_cloudwatch.$$.eventos"
+    local ahora_ms cursor_ms inicio_ms solapamiento_ms
+    local linea campos=()
+    local event_id timestamp_ms timestamp_iso usuario host_mysql schema duracion lock_time
+    local rows_sent rows_examined fingerprint sql
+
+    if ! booleano_habilitado "$CHECK_MYSQL_SLOW_QUERY_DETAILS"; then
+        return 0
+    fi
+
+    if [[ "$AWS_CLI_HABILITADO" != "1" ]]; then
+        registrar "WARN" "mysql_slow_query" "detalle=no_disponible motivo=aws_cli_deshabilitado"
+        return 0
+    fi
+
+    if [[ -z "$MYSQL_SLOW_QUERY_LOG_GROUP" ]]; then
+        registrar "WARN" "mysql_slow_query" "detalle=no_disponible motivo=log_group_no_configurado"
+        return 0
+    fi
+
+    if ! command -v aws >/dev/null 2>&1; then
+        registrar "ERROR" "mysql_slow_query" "aws_cli=no_instalado"
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        registrar "ERROR" "mysql_slow_query" "python3=no_instalado"
+        return 0
+    fi
+
+    ahora_ms="$(date +%s%3N)"
+
+    if [[ ! -r "$archivo_cursor" ]]; then
+        printf '%s\n' "$ahora_ms" > "$archivo_cursor"
+        registrar "INFO" "mysql_slow_query" "cursor_inicializado timestamp_ms=${ahora_ms} log_group=${MYSQL_SLOW_QUERY_LOG_GROUP}"
+        return 0
+    fi
+
+    cursor_ms="$(tr -dc '0-9' < "$archivo_cursor")"
+    if [[ -z "$cursor_ms" ]]; then
+        cursor_ms="$ahora_ms"
+    fi
+
+    solapamiento_ms=$((MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS * 1000))
+    if (( cursor_ms > solapamiento_ms )); then
+        inicio_ms=$((cursor_ms - solapamiento_ms))
+    else
+        inicio_ms=0
+    fi
+
+    if ! ejecutar_aws logs filter-log-events \
+        --log-group-name "$MYSQL_SLOW_QUERY_LOG_GROUP" \
+        --start-time "$inicio_ms" \
+        --end-time "$ahora_ms" \
+        --filter-pattern '"# Query_time:"' \
+        --output json; then
+        registrar "WARN" "mysql_slow_query" "operacion=FilterLogEvents error=${AWS_ERROR_COMANDO:-desconocido}"
+        return 0
+    fi
+
+    printf '%s' "$AWS_SALIDA_COMANDO" > "$archivo_json"
+
+    if ! extraer_eventos_mysql_slow "$archivo_json" > "$archivo_eventos"; then
+        registrar "WARN" "mysql_slow_query" "parser=no_disponible log_group=${MYSQL_SLOW_QUERY_LOG_GROUP}"
+        rm -f "$archivo_json" "$archivo_eventos"
+        return 0
+    fi
+
+    while IFS='|' read -r -a campos; do
+        if (( ${#campos[@]} != 12 )); then
+            registrar "WARN" "mysql_slow_query" "parser=registro_invalido campos=${#campos[@]} esperados=12"
+            continue
+        fi
+
+        event_id="$(printf '%s' "${campos[0]}" | base64 -d 2>/dev/null || true)"
+        timestamp_ms="$(printf '%s' "${campos[1]}" | base64 -d 2>/dev/null || true)"
+        timestamp_iso="$(printf '%s' "${campos[2]}" | base64 -d 2>/dev/null || true)"
+        usuario="$(printf '%s' "${campos[3]}" | base64 -d 2>/dev/null || true)"
+        host_mysql="$(printf '%s' "${campos[4]}" | base64 -d 2>/dev/null || true)"
+        schema="$(printf '%s' "${campos[5]}" | base64 -d 2>/dev/null || true)"
+        duracion="$(printf '%s' "${campos[6]}" | base64 -d 2>/dev/null || true)"
+        lock_time="$(printf '%s' "${campos[7]}" | base64 -d 2>/dev/null || true)"
+        rows_sent="$(printf '%s' "${campos[8]}" | base64 -d 2>/dev/null || true)"
+        rows_examined="$(printf '%s' "${campos[9]}" | base64 -d 2>/dev/null || true)"
+        fingerprint="$(printf '%s' "${campos[10]}" | base64 -d 2>/dev/null || true)"
+        sql="$(printf '%s' "${campos[11]}" | base64 -d 2>/dev/null || true)"
+
+        [[ -n "$event_id" && "$timestamp_ms" =~ ^[0-9]+$ && -n "$fingerprint" ]] || continue
+        es_numero "$duracion" || continue
+
+        procesar_evento_mysql_slow \
+            "$event_id" "$timestamp_ms" "$timestamp_iso" "$usuario" "$host_mysql" \
+            "$schema" "$duracion" "$lock_time" "$rows_sent" "$rows_examined" \
+            "$fingerprint" "$sql"
+    done < "$archivo_eventos"
+
+    rm -f "$archivo_json" "$archivo_eventos"
+    printf '%s\n' "$ahora_ms" > "$archivo_cursor"
+}
+
 # Obtiene el punto más reciente de una métrica de RDS.
 #
 # Argumentos:
@@ -1292,6 +1711,7 @@ ejecutar_revision() {
     monitorear_apache
     analyze_logs
     monitorear_mysql
+    monitorear_mysql_slow_queries
     monitorear_aws
 
     registrar "INFO" "monitor" "fin_revision"
