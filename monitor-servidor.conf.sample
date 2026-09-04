@@ -6,8 +6,8 @@
 # Pushover
 ###############################################################################
 
-USER_KEY="utxzw23h2u8kf3hf1z82bmiss2r3pi"
-API_TOKEN="au2yvfwtn94wku7io4jigozgdxb4eu"
+USER_KEY="xxxxx"
+API_TOKEN="xxxxx"
 PUSHOVER_HABILITADO=1
 
 # Repite una alerta todavía activa como máximo cada 30 minutos.
@@ -122,8 +122,14 @@ APACHE_SITIOS_LOGS=(
 )
 
 CHECK_CONFIG_ERRORS=true
-REGEX_APACHE_CONFIG_ERROR='Syntax error|Cannot load module|internal redirects'
+REGEX_APACHE_CONFIG_ERROR='AH00526: Syntax error|Syntax error on line [0-9]+ of /etc/apache2/|Cannot load module|Invalid command|internal redirects due to probable configuration error'
 UMBRAL_APACHE_CONFIG_ERROR=1
+
+# Errores severos de PHP / aplicación registrados en error.log.
+# Warning, Notice y Deprecated quedan fuera por defecto para evitar ruido.
+CHECK_PHP_ERRORS=true
+REGEX_APACHE_PHP_ERROR='PHP Parse error|PHP Fatal error|PHP Recoverable fatal error|Uncaught (Error|Exception)'
+UMBRAL_APACHE_PHP_ERROR=1
 
 CHECK_RESOURCE_ERRORS=true
 REGEX_APACHE_RESOURCE_ERROR='MaxRequestWorkers|Out of memory|Error reading from remote server'

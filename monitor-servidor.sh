@@ -105,7 +105,10 @@ if ! declare -p APACHE_SITIOS_LOGS >/dev/null 2>&1; then
 fi
 CHECK_CONFIG_ERRORS="${CHECK_CONFIG_ERRORS:-true}"
 UMBRAL_APACHE_CONFIG_ERROR="${UMBRAL_APACHE_CONFIG_ERROR:-1}"
-REGEX_APACHE_CONFIG_ERROR="${REGEX_APACHE_CONFIG_ERROR:-Syntax error|Cannot load module|internal redirects}"
+REGEX_APACHE_CONFIG_ERROR="${REGEX_APACHE_CONFIG_ERROR:-AH00526: Syntax error|Syntax error on line [0-9]+ of /etc/apache2/|Cannot load module|Invalid command|internal redirects due to probable configuration error}"
+CHECK_PHP_ERRORS="${CHECK_PHP_ERRORS:-true}"
+UMBRAL_APACHE_PHP_ERROR="${UMBRAL_APACHE_PHP_ERROR:-1}"
+REGEX_APACHE_PHP_ERROR="${REGEX_APACHE_PHP_ERROR:-PHP Parse error|PHP Fatal error|PHP Recoverable fatal error|Uncaught (Error|Exception)}"
 CHECK_RESOURCE_ERRORS="${CHECK_RESOURCE_ERRORS:-true}"
 UMBRAL_APACHE_RESOURCE_ERROR="${UMBRAL_APACHE_RESOURCE_ERROR:-3}"
 REGEX_APACHE_RESOURCE_ERROR="${REGEX_APACHE_RESOURCE_ERROR:-MaxRequestWorkers|Out of memory|Error reading from remote server}"
@@ -809,11 +812,15 @@ procesar_categoria_log_apache() {
     local archivo_nuevas="$7"
     local ruta_log="$8"
     local evento_log="$9"
-    local sitio_clave
+    local sitio_clave titulo_alerta
     local archivo_contador muestra_errores="" detalles_pushover="" muestras_bloqueadas=""
     local ocurrencias_nuevas=0 ocurrencias_bloqueadas=0 ocurrencias_acumuladas=0 ultima_alerta=0 ahora
 
     sitio_clave="$(printf '%s' "$sitio" | sed 's/[^[:alnum:]_-]/_/g')"
+    titulo_alerta="Error Apache ${categoria} - ${NOMBRE_SERVIDOR}"
+    if [[ "$clave" == "php_aplicacion" ]]; then
+        titulo_alerta="Error PHP / Aplicación - ${NOMBRE_SERVIDOR}"
+    fi
     if [[ "$clave" == "seguridad" ]]; then
         archivo_contador="${DIRECTORIO_ESTADO}/apache_${sitio_clave}_${clave}_accionable.contador"
     else
@@ -890,7 +897,7 @@ procesar_categoria_log_apache() {
                 | awk -v hay_mas="$((ocurrencias_nuevas > 3 ? 1 : 0))" 'BEGIN { RS=" \\|\\| " } { detalle=$0; sub(/^(\[[^]]+\][[:space:]]*)+/, "", detalle); if (length(detalle) > 250) detalle=substr(detalle, 1, 247) "..."; printf "%s- %s", (NR > 1 ? "\n" : ""), detalle } END { if (hay_mas) printf "\n… (más entradas en log)" }')"
 
             if enviar_pushover \
-                "Error Apache ${categoria} - ${NOMBRE_SERVIDOR}" \
+                "$titulo_alerta" \
                 "Sitio=${sitio}; categoría=${categoria}; log=${ruta_log}.
 Ocurrencias=${ocurrencias_acumuladas}; umbral=${umbral}.
 Detalles:
@@ -970,7 +977,7 @@ obtener_lineas_nuevas_log_apache() {
 }
 
 # Analiza los error.log y access.log configurados para cada sitio Apache.
-# Las categorías Configuración, Recursos y Seguridad se evalúan sobre error.log;
+# Las categorías Configuración, PHP / Aplicación, Recursos y Seguridad se evalúan sobre error.log;
 # HTTP 5xx se evalúa sobre access.log usando el código de estado HTTP registrado.
 analyze_logs() {
     local definicion sitio error_log access_log sitio_clave
@@ -992,8 +999,13 @@ analyze_logs() {
             "$sitio_clave" "error" "$error_log" "$archivo_nuevas_error" "apache_error_log"; then
 
             procesar_categoria_log_apache \
-                "$sitio" "configuracion" "Configuración" "$CHECK_CONFIG_ERRORS" \
+                "$sitio" "configuracion_apache" "Configuración" "$CHECK_CONFIG_ERRORS" \
                 "$REGEX_APACHE_CONFIG_ERROR" "$UMBRAL_APACHE_CONFIG_ERROR" \
+                "$archivo_nuevas_error" "$error_log" "apache_error_log"
+
+            procesar_categoria_log_apache \
+                "$sitio" "php_aplicacion" "PHP / Aplicación" "$CHECK_PHP_ERRORS" \
+                "$REGEX_APACHE_PHP_ERROR" "$UMBRAL_APACHE_PHP_ERROR" \
                 "$archivo_nuevas_error" "$error_log" "apache_error_log"
 
             procesar_categoria_log_apache \
