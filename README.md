@@ -1,6 +1,6 @@
 # Monitor de servidor EC2 / Apache / MySQL-RDS
 
-`monitor-servidor.sh` es un monitor en Bash diseñado para ejecutarse en una instancia Ubuntu sobre AWS EC2. Supervisa el sistema operativo, Apache HTTP Server, logs de múltiples VirtualHosts, MySQL/MariaDB en AWS RDS, métricas de CloudWatch y el estado AWS de EC2/RDS. Las alertas se envían mediante Pushover.
+`monitor-servidor.sh` es un monitor en Bash diseñado para ejecutarse en una instancia Ubuntu sobre AWS EC2. Supervisa el sistema operativo, espacio e inodos de disco, crecimiento de directorios, Apache HTTP Server, logs de múltiples VirtualHosts, MySQL/MariaDB en AWS RDS, métricas de CloudWatch y el estado AWS de EC2/RDS. Las alertas se envían mediante Pushover.
 
 La instalación recomendada utiliza CRON y ejecuta una revisión cada minuto con `--una-vez`. El monitor usa `flock` para evitar ejecuciones simultáneas.
 
@@ -32,7 +32,7 @@ Se instala en:
 
 ### `monitor-servidor.conf`
 
-Contiene la configuración del monitor: nombre del servidor, thresholds, Pushover, sitios Apache, MySQL/RDS y AWS.
+Contiene la configuración del monitor: nombre del servidor, thresholds, Pushover, disco y directorios, sitios Apache, MySQL/RDS y AWS.
 
 Se instala en:
 
@@ -95,6 +95,11 @@ El monitor utiliza, entre otros, los siguientes comandos:
 - `grep`
 - `sed`
 - `stat`
+- `df`
+- `du`
+- `nice`
+- `timeout`, cuando está disponible, para limitar la duración de `du`
+- `ionice`, cuando está disponible, para ejecutar `du` con baja prioridad de I/O
 - `systemctl`
 - `aws`, cuando el monitoreo AWS está habilitado
 
@@ -256,6 +261,9 @@ Ahí se almacenan, entre otros:
 - cursor de lectura del Slow Query Log en CloudWatch;
 - `eventId` recientes de slow queries para evitar reprocesamiento;
 - estado por fingerprint de slow queries, incluyendo repeticiones y cooldown;
+- último momento de snapshot de directorios;
+- snapshots históricos de tamaño de directorios;
+- cooldown independiente por ruta para alertas de crecimiento;
 - lock de ejecución.
 
 No elimine este directorio durante la operación normal. Hacerlo reinicia la memoria persistente del monitor.
@@ -263,6 +271,99 @@ No elimine este directorio durante la operación normal. Hacerlo reinicia la mem
 ### Primera lectura de logs Apache
 
 Cuando el monitor encuentra un log Apache sin cursor previo, posiciona el cursor al final del archivo. Esto evita generar alertas por miles de eventos históricos existentes antes de instalar el monitor.
+
+---
+
+## 8A. Disco, inodos y crecimiento de directorios
+
+### Espacio e inodos
+
+El monitoreo de filesystem se habilita con:
+
+```bash
+CHECK_ESPACIO_DISCO=true
+```
+
+Las rutas configuradas se utilizan para identificar los filesystems que deben revisarse. Si varias rutas pertenecen al mismo punto de montaje, el monitor mide ese filesystem una sola vez para evitar alertas duplicadas. La configuración actual es:
+
+```bash
+RUTAS_DISCO_MONITOREADAS=(
+    "/"
+    "/var/log"
+    "/var/lib"
+    "/var/cache"
+    "/ztrabajo/www"
+    "/home"
+    "/tmp"
+)
+
+UMBRAL_DISCO_USO_PCT=85
+UMBRAL_DISCO_INODOS_PCT=90
+TIEMPO_SOSTENIDO_DISCO=120
+```
+
+Para cada filesystem el monitor registra, cuando están disponibles:
+
+```text
+filesystem
+punto de montaje
+tamaño total
+espacio usado
+espacio disponible
+porcentaje de uso
+porcentaje de inodos utilizados
+```
+
+El uso de espacio y el uso de inodos mantienen estados de alerta independientes. Una condición debe mantenerse durante `TIEMPO_SOSTENIDO_DISCO` antes de generar Pushover y utiliza el cooldown global de alertas. Cuando una condición previamente alertada vuelve a valores normales, puede generarse la recuperación habitual si `ALERTAR_RECUPERACION=1`.
+
+### Crecimiento de directorios
+
+El monitoreo histórico se habilita con:
+
+```bash
+CHECK_CRECIMIENTO_DIRECTORIOS=true
+DIRECTORIO_SNAPSHOTS_DIRECTORIOS="${DIRECTORIO_ESTADO}/snapshots-directorios"
+INTERVALO_SNAPSHOT_DIRECTORIOS=1800
+VENTANA_CRECIMIENTO_DIRECTORIOS=86400
+TOLERANCIA_SNAPSHOT_DIRECTORIOS=3600
+RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS=7
+TIMEOUT_DU_DIRECTORIO=120
+SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO=86400
+```
+
+El intervalo se mide por tiempo real y no por cantidad de ejecuciones del monitor. Con los valores actuales se crea un snapshot aproximadamente cada 30 minutos y se compara cada ruta contra el snapshot más cercano a 24 horas atrás, aceptando una diferencia máxima de una hora. Los snapshots de más de 7 días se eliminan automáticamente.
+
+Las rutas y sus thresholds se declaran con el formato:
+
+```text
+ruta|crecimiento_porcentual|minimo_absoluto_mb
+```
+
+Configuración inicial:
+
+```bash
+RUTAS_CRECIMIENTO_DIRECTORIOS=(
+    "/var/log|20|512"
+    "/var/lib|20|1024"
+    "/var/cache|50|512"
+    "/ztrabajo/www|20|1024"
+    "/home|20|1024"
+    "/tmp|100|512"
+)
+```
+
+Para generar una alerta deben cumplirse **simultáneamente** el porcentaje y el crecimiento absoluto configurados para esa ruta. Por ejemplo, `/var/log|20|512` requiere al menos 20% de crecimiento y al menos 512 MB adicionales dentro de la ventana histórica.
+
+El tamaño se obtiene con `du -skx`, evitando cruzar a otros filesystems montados debajo de la ruta. El proceso se ejecuta con `nice -n 19`; si `ionice` está disponible se utiliza `ionice -c3`, y si existe `timeout` se limita cada medición a `TIMEOUT_DU_DIRECTORIO`. Un timeout o error de `du` se registra como `WARN` y esa ruta se omite en el snapshot de esa ejecución.
+
+Cuando todavía no existe un snapshot comparable, el tamaño actual se registra pero no se genera alerta. Cada ruta tiene un cooldown independiente de `SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO`, actualmente 24 horas.
+
+Los eventos se registran como:
+
+```text
+disco
+crecimiento_directorio
+```
 
 ---
 
@@ -350,9 +451,27 @@ Un campo puede quedar vacío:
 
 No utilice `|` dentro del nombre del sitio ni dentro de las rutas.
 
-Las categorías Configuración, Recursos y Seguridad se analizan sobre `error.log`. HTTP 5xx se analiza sobre `access.log`.
+Las categorías Configuración, PHP / Aplicación, Recursos y Seguridad se analizan sobre `error.log`. HTTP 5xx se analiza sobre `access.log`.
 
-Cada `sitio + categoría` mantiene su contador independiente y cada `sitio + tipo de log` mantiene su propio cursor.
+La categoría **Configuración** se limita a errores propios de Apache, evitando clasificar como configuración un `PHP Parse error` que contenga el texto genérico `syntax error`. La configuración actual es:
+
+```bash
+CHECK_CONFIG_ERRORS=true
+REGEX_APACHE_CONFIG_ERROR='AH00526: Syntax error|Syntax error on line [0-9]+ of /etc/apache2/|Cannot load module|Invalid command|internal redirects due to probable configuration error'
+UMBRAL_APACHE_CONFIG_ERROR=1
+```
+
+La categoría **PHP / Aplicación** agrupa errores severos registrados en `error.log`:
+
+```bash
+CHECK_PHP_ERRORS=true
+REGEX_APACHE_PHP_ERROR='PHP Parse error|PHP Fatal error|PHP Recoverable fatal error|Uncaught (Error|Exception)'
+UMBRAL_APACHE_PHP_ERROR=1
+```
+
+`PHP Warning`, `PHP Notice` y mensajes `Deprecated` quedan fuera de esta categoría por defecto para reducir ruido. Pueden incorporarse posteriormente ajustando la expresión regular en `monitor-servidor.conf` si se desea vigilarlos.
+
+Cada `sitio + categoría` mantiene su contador independiente y cada `sitio + tipo de log` mantiene su propio cursor. Configuración Apache y PHP / Aplicación utilizan claves de estado separadas, por lo que sus ocurrencias no se mezclan.
 
 ---
 
@@ -595,7 +714,7 @@ Las credenciales Pushover son secretos. Mantenga `monitor-servidor.conf` con per
 
 ## 15. Thresholds y cooldown
 
-Las métricas de CPU, memoria, Apache, MySQL y RDS utilizan thresholds configurables. Varias condiciones requieren permanecer anómalas durante un tiempo mínimo antes de enviar una alerta.
+Las métricas de CPU, memoria, espacio de disco, inodos, Apache, MySQL y RDS utilizan thresholds configurables. Varias condiciones requieren permanecer anómalas durante un tiempo mínimo antes de enviar una alerta.
 
 El monitor persiste el estado para evitar que cada ejecución de CRON reinicie esa ventana.
 
@@ -608,6 +727,14 @@ SEGUNDOS_COOLDOWN_ALERTA=1800
 por lo que una condición todavía activa no debe bombardear Pushover cada minuto.
 
 Para errores Apache, las ocurrencias se acumulan por sitio y categoría. La alerta requiere que en la ejecución actual exista al menos una ocurrencia nueva y que el acumulado haya alcanzado el threshold.
+
+El crecimiento de directorios utiliza un cooldown independiente por ruta:
+
+```bash
+SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO=86400
+```
+
+Por lo tanto, una misma ruta puede enviar como máximo una alerta de crecimiento cada 24 horas con la configuración actual.
 
 Las slow queries detalladas utilizan un cooldown independiente:
 
@@ -655,6 +782,21 @@ sudo cat /etc/cron.d/monitor-servidor
 
 Después de algunos minutos debe observarse una secuencia de eventos `inicio_revision` y `fin_revision` en el log.
 
+### 6. Disco y crecimiento de directorios
+
+Compruebe las mediciones de filesystem:
+
+```bash
+sudo grep '"evento":"disco"' /var/log/monitor-servidor/monitor.log | tail -20
+```
+
+Los snapshots de crecimiento no se ejecutan cada minuto. Después de alcanzar `INTERVALO_SNAPSHOT_DIRECTORIOS`, compruebe:
+
+```bash
+sudo grep '"evento":"crecimiento_directorio"' /var/log/monitor-servidor/monitor.log | tail -20
+sudo ls -lh /var/lib/monitor-servidor/snapshots-directorios/
+```
+
 ---
 
 ## 17. Diagnóstico rápido
@@ -692,6 +834,20 @@ curl -v 'http://127.0.0.1/server-status?auto'
 ```
 
 Revise `mod_status`, las reglas `Require` y `APACHE_HOST_HEADER` si el endpoint depende de un VirtualHost concreto.
+
+### Eventos `disco` con `ruta=... estado=no_existe`
+
+Compruebe que las rutas declaradas en `RUTAS_DISCO_MONITOREADAS` existan en ese servidor. Las rutas inexistentes se registran como `WARN` y se omiten.
+
+### Eventos `crecimiento_directorio` con `estado=timeout` o `du_error`
+
+Compruebe manualmente el tamaño de la ruta afectada y el tiempo que tarda `du`:
+
+```bash
+sudo time du -skx -- /ruta/a/revisar
+```
+
+Si el directorio es muy grande, revise `TIMEOUT_DU_DIRECTORIO` antes de aumentarlo. El objetivo es evitar que una medición pesada bloquee una ejecución completa del monitor.
 
 ### `aws_cli=no_instalado`
 
