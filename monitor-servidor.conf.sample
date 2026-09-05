@@ -15,6 +15,23 @@ SEGUNDOS_COOLDOWN_ALERTA=1800
 ALERTAR_RECUPERACION=1
 
 ###############################################################################
+# Heartbeat externo ("dead man's switch")
+###############################################################################
+
+# Si el host se cae, se congela, o el daemon/CRON dejan de ejecutar el
+# monitor, nadie podría enviar Pushover para avisarlo. Este ping a un
+# servicio externo tipo Healthchecks.io resuelve ese caso: si el ping deja
+# de llegar dentro del período configurado en ese servicio, es él quien
+# notifica la ausencia.
+#
+# Cree un check en https://healthchecks.io (u otra instancia propia) con un
+# período igual a la cadencia de CRON (1 minuto) y un margen de gracia
+# razonable, y configure ahí su propia notificación (Pushover, email, etc.).
+HEALTHCHECKS_HABILITADO=0
+HEALTHCHECKS_URL="https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+HEALTHCHECKS_TIMEOUT=10
+
+###############################################################################
 # Estado y ejecución
 ###############################################################################
 

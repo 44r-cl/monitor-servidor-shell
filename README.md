@@ -718,6 +718,32 @@ Las credenciales Pushover son secretos. Mantenga `monitor-servidor.conf` con per
 
 ---
 
+## 14A. Heartbeat externo ("dead man's switch")
+
+Todas las alertas anteriores dependen de que el propio host esté vivo y de que el monitor se siga ejecutando. Si el servidor se cae por completo, se congela, o el daemon/CRON dejan de ejecutar el monitor, no hay quién dispare Pushover para avisarlo.
+
+Para cubrir ese caso, el monitor puede enviar un ping de heartbeat a un servicio externo tipo [Healthchecks.io](https://healthchecks.io) al final de cada revisión exitosa. Ese servicio, no el propio host, es quien detecta la ausencia de pings y notifica.
+
+Se habilita con:
+
+```bash
+HEALTHCHECKS_HABILITADO=1
+HEALTHCHECKS_URL="https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+HEALTHCHECKS_TIMEOUT=10
+```
+
+Configuración recomendada del lado de Healthchecks.io:
+
+- período de chequeo igual a la cadencia de CRON (1 minuto);
+- un margen de gracia razonable para absorber una revisión puntualmente lenta;
+- la notificación (Pushover, email, etc.) se configura en Healthchecks.io, no en este monitor.
+
+El ping se envía siempre al final de `ejecutar_revision()`, sin importar si algún check anterior generó una alerta. Su único propósito es certificar que el monitor completó un ciclo; no reemplaza ni depende del resto de las alertas. Un fallo aislado al enviarlo solo se registra como `WARN` en `monitor.log`: no se reintenta, porque la garantía real la aporta el servicio externo al notificar la ausencia de pings, no un reintento local.
+
+`HEALTHCHECKS_URL` actúa como secreto y debe tratarse igual que las credenciales de Pushover o MySQL.
+
+---
+
 ## 15. Thresholds y cooldown
 
 Las métricas de CPU, memoria, espacio de disco, inodos, Apache, MySQL y RDS utilizan thresholds configurables. Varias condiciones requieren permanecer anómalas durante un tiempo mínimo antes de enviar una alerta.
@@ -897,6 +923,16 @@ sudo cat /etc/cron.d/monitor-servidor
 sudo systemctl status cron
 sudo grep -E 'inicio_revision|fin_revision' /var/log/monitor-servidor/monitor.log | tail
 ```
+
+### Evento `heartbeat` con `WARN`
+
+Compruebe manualmente el ping:
+
+```bash
+curl -v "https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+Revise conectividad de salida hacia Healthchecks.io, `HEALTHCHECKS_URL` en `monitor-servidor.conf` y `HEALTHCHECKS_HABILITADO=1`. Un fallo aislado no es crítico: el propio Healthchecks.io notificará si los pings dejan de llegar dentro del período configurado ahí.
 
 ---
 

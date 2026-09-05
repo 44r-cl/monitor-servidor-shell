@@ -46,6 +46,14 @@ SEGUNDOS_ENTRE_REINTENTOS="${SEGUNDOS_ENTRE_REINTENTOS:-2}"
 SEGUNDOS_COOLDOWN_ALERTA="${SEGUNDOS_COOLDOWN_ALERTA:-1800}"
 ALERTAR_RECUPERACION="${ALERTAR_RECUPERACION:-1}"
 
+# Heartbeat externo ("dead man's switch"). Si el host, el daemon o CRON dejan
+# de ejecutar el monitor, nadie enviaría Pushover para avisarlo. Un servicio
+# externo tipo Healthchecks.io detecta la ausencia de este ping y notifica
+# por su cuenta.
+HEALTHCHECKS_HABILITADO="${HEALTHCHECKS_HABILITADO:-0}"
+HEALTHCHECKS_URL="${HEALTHCHECKS_URL:-}"
+HEALTHCHECKS_TIMEOUT="${HEALTHCHECKS_TIMEOUT:-10}"
+
 # Estado y logs.
 DIRECTORIO_ESTADO="${DIRECTORIO_ESTADO:-/var/tmp/monitor-servidor-${USER:-usuario}}"
 ARCHIVO_LOG="${ARCHIVO_LOG:-${DIRECTORIO_ESTADO}/monitor.log}"
@@ -277,6 +285,39 @@ enviar_pushover() {
     done
 
     registrar "ERROR" "pushover" "No fue posible enviar la notificación tras ${INTENTOS_PUSHOVER} intentos."
+    return 1
+}
+
+# Envía un ping de heartbeat ("dead man's switch") a un servicio externo tipo
+# Healthchecks.io al final de cada revisión. No reintenta: si el host, el
+# daemon o CRON dejan de ejecutar el monitor, es el servicio externo quien
+# debe notificar la ausencia de pings, por lo que un fallo aislado aquí solo
+# se registra como advertencia.
+enviar_heartbeat() {
+    if ! booleano_habilitado "$HEALTHCHECKS_HABILITADO"; then
+        return 0
+    fi
+
+    if [[ -z "$HEALTHCHECKS_URL" ]]; then
+        registrar "WARN" "heartbeat" "HEALTHCHECKS_HABILITADO=1 pero HEALTHCHECKS_URL no está configurada."
+        return 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        registrar "WARN" "heartbeat" "No se encontró curl."
+        return 1
+    fi
+
+    if curl --fail --silent --show-error \
+        --connect-timeout 5 \
+        --max-time "$HEALTHCHECKS_TIMEOUT" \
+        --output /dev/null \
+        "$HEALTHCHECKS_URL" >/dev/null 2>&1; then
+        registrar "INFO" "heartbeat" "ping_enviado"
+        return 0
+    fi
+
+    registrar "WARN" "heartbeat" "No fue posible enviar el ping de heartbeat."
     return 1
 }
 
@@ -2050,6 +2091,10 @@ ejecutar_revision() {
     monitorear_aws
 
     registrar "INFO" "monitor" "fin_revision"
+
+    # Se envía siempre, sin importar si algún check anterior falló o generó
+    # alertas: este ping solo certifica que el monitor completó el ciclo.
+    enviar_heartbeat
 }
 
 mostrar_ayuda() {
