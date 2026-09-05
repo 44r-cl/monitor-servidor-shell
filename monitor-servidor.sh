@@ -72,6 +72,12 @@ TIEMPO_SOSTENIDO_CPU="${TIEMPO_SOSTENIDO_CPU:-300}"
 UMBRAL_MEMORIA_SISTEMA_PCT="${UMBRAL_MEMORIA_SISTEMA_PCT:-90}"
 TIEMPO_SOSTENIDO_MEMORIA="${TIEMPO_SOSTENIDO_MEMORIA:-120}"
 
+# Snapshot de diagnóstico: al disparar CPU o memoria alta, adjunta el top de
+# procesos por %CPU o %MEM (solo el nombre del binario, sin argumentos, para
+# no exponer secretos que pudieran ir en la línea de comando).
+DIAGNOSTICO_PROCESOS_HABILITADO="${DIAGNOSTICO_PROCESOS_HABILITADO:-1}"
+DIAGNOSTICO_PROCESOS_CANTIDAD="${DIAGNOSTICO_PROCESOS_CANTIDAD:-5}"
+
 # Disco y crecimiento de directorios.
 CHECK_ESPACIO_DISCO="${CHECK_ESPACIO_DISCO:-true}"
 UMBRAL_DISCO_USO_PCT="${UMBRAL_DISCO_USO_PCT:-85}"
@@ -446,8 +452,34 @@ medir_memoria_sistema() {
     porcentaje "$((total_kb - disponible_kb))" "$total_kb"
 }
 
+# Captura el top de procesos por %CPU o %MEM y lo devuelve como una sola línea
+# (formato "pid usuario %cpu %mem comando || ..."), lista para incluir en
+# Pushover y en el log sin depender de saltos de línea. Solo se usa el nombre
+# del binario (comm), no la línea de comando completa, para no exponer
+# posibles secretos pasados como argumentos.
+#
+# Argumentos:
+#   1: criterio de --sort de ps (-%cpu o -%mem).
+capturar_top_procesos() {
+    local orden="$1"
+
+    if ! booleano_habilitado "$DIAGNOSTICO_PROCESOS_HABILITADO"; then
+        return 1
+    fi
+
+    if ! command -v ps >/dev/null 2>&1; then
+        return 1
+    fi
+
+    ps -eo pid,user,%cpu,%mem,comm --sort="$orden" 2>/dev/null \
+        | tail -n +2 \
+        | head -n "$DIAGNOSTICO_PROCESOS_CANTIDAD" \
+        | awk '{gsub(/[[:space:]]+/, " "); sub(/^ /, ""); printf "%s%s", (NR > 1 ? " || " : ""), $0}'
+}
+
 monitorear_sistema() {
     local cpu_pct memoria_pct condicion_cpu=0 condicion_memoria=0 carga
+    local top_procesos_cpu="" top_procesos_memoria="" mensaje_cpu mensaje_memoria
 
     cpu_pct="$(medir_cpu_sistema)"
     memoria_pct="$(medir_memoria_sistema)"
@@ -457,6 +489,15 @@ monitorear_sistema() {
 
     if mayor_igual "$cpu_pct" "$UMBRAL_CPU_SISTEMA_PCT"; then
         condicion_cpu=1
+        top_procesos_cpu="$(capturar_top_procesos '-%cpu')"
+        if [[ -n "$top_procesos_cpu" ]]; then
+            registrar "WARN" "sistema" "cpu_pct=${cpu_pct} top_procesos_cpu=${top_procesos_cpu}"
+        fi
+    fi
+
+    mensaje_cpu="CPU ${cpu_pct}% >= ${UMBRAL_CPU_SISTEMA_PCT}% durante al menos ${TIEMPO_SOSTENIDO_CPU}s. Load: ${carga}."
+    if [[ -n "$top_procesos_cpu" ]]; then
+        mensaje_cpu="${mensaje_cpu} Top procesos CPU: ${top_procesos_cpu}"
     fi
 
     gestionar_alerta \
@@ -464,12 +505,21 @@ monitorear_sistema() {
         "$condicion_cpu" \
         "$TIEMPO_SOSTENIDO_CPU" \
         "CPU alta - ${NOMBRE_SERVIDOR}" \
-        "CPU ${cpu_pct}% >= ${UMBRAL_CPU_SISTEMA_PCT}% durante al menos ${TIEMPO_SOSTENIDO_CPU}s. Load: ${carga}." \
+        "$mensaje_cpu" \
         1 \
         "CPU normalizada en ${NOMBRE_SERVIDOR}: ${cpu_pct}%."
 
     if mayor_igual "$memoria_pct" "$UMBRAL_MEMORIA_SISTEMA_PCT"; then
         condicion_memoria=1
+        top_procesos_memoria="$(capturar_top_procesos '-%mem')"
+        if [[ -n "$top_procesos_memoria" ]]; then
+            registrar "WARN" "sistema" "memoria_usada_pct=${memoria_pct} top_procesos_memoria=${top_procesos_memoria}"
+        fi
+    fi
+
+    mensaje_memoria="Memoria utilizada ${memoria_pct}% >= ${UMBRAL_MEMORIA_SISTEMA_PCT}%."
+    if [[ -n "$top_procesos_memoria" ]]; then
+        mensaje_memoria="${mensaje_memoria} Top procesos memoria: ${top_procesos_memoria}"
     fi
 
     gestionar_alerta \
@@ -477,7 +527,7 @@ monitorear_sistema() {
         "$condicion_memoria" \
         "$TIEMPO_SOSTENIDO_MEMORIA" \
         "Memoria alta - ${NOMBRE_SERVIDOR}" \
-        "Memoria utilizada ${memoria_pct}% >= ${UMBRAL_MEMORIA_SISTEMA_PCT}%." \
+        "$mensaje_memoria" \
         1 \
         "Memoria normalizada en ${NOMBRE_SERVIDOR}: ${memoria_pct}% utilizada."
 }

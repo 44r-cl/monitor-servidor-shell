@@ -54,6 +54,13 @@ SEGUNDOS_MUESTRA_CPU=2
 UMBRAL_MEMORIA_SISTEMA_PCT=90
 TIEMPO_SOSTENIDO_MEMORIA=120
 
+# Al disparar CPU o memoria alta, adjunta el top de procesos (pid, usuario,
+# %cpu, %mem, nombre del binario) en el mensaje de Pushover y en el log.
+# Solo se usa el nombre del binario, sin argumentos, para no exponer
+# secretos que pudieran ir en la línea de comando.
+DIAGNOSTICO_PROCESOS_HABILITADO=1
+DIAGNOSTICO_PROCESOS_CANTIDAD=5
+
 ###############################################################################
 # Disco y crecimiento de directorios
 ###############################################################################

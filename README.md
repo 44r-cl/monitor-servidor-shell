@@ -782,6 +782,19 @@ SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
 
 Este cooldown se aplica por fingerprint, por lo que una query lógica ya alertada no vuelve a enviar Pushover durante una hora aunque reaparezca. Otras queries con fingerprint diferente pueden alertar de forma independiente.
 
+### Snapshot de diagnóstico en alertas de CPU/memoria
+
+```bash
+DIAGNOSTICO_PROCESOS_HABILITADO=1
+DIAGNOSTICO_PROCESOS_CANTIDAD=5
+```
+
+Cuando `UMBRAL_CPU_SISTEMA_PCT` o `UMBRAL_MEMORIA_SISTEMA_PCT` se superan, el monitor captura el top de procesos (`pid`, usuario, `%cpu`, `%mem` y nombre del binario) ordenado por la métrica que se disparó, y lo agrega tanto al mensaje de Pushover como a un evento `WARN` en `monitor.log`. El objetivo es evitar tener que entrar por SSH a investigar qué proceso causó el pico, que para cuando se investigue puede que ya haya pasado.
+
+Se registra en cada ejecución donde la condición esté activa, no solo cuando efectivamente se envía Pushover, de modo que el snapshot enviado sea siempre el más cercano posible al momento real del envío.
+
+Solo se incluye el nombre del binario (`comm`), no la línea de comando completa, para no exponer posibles secretos pasados como argumentos a algún proceso.
+
 ---
 
 ## 16. Verificación posterior a la instalación
