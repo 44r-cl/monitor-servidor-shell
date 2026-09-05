@@ -422,6 +422,12 @@ CPULoad
 
 `APACHE_MAX_REQUEST_WORKERS` en `monitor-servidor.conf` debe coincidir con el valor efectivo configurado en Apache.
 
+### Comportamiento cuando `server-status` no responde
+
+Las conexiones TCP establecidas hacia 80/443 se miden con `ss` y no dependen de `mod_status`. Por eso la alerta de conexiones altas (`apache_conexiones`) se sigue evaluando y notificando —incluida su recuperación— aunque `server-status` no responda.
+
+La saturación de workers (`apache_saturacion`) sí depende de `BusyWorkers`, un dato que solo entrega `server-status`. Si el endpoint deja de responder, esa alerta queda en su último estado conocido hasta que vuelva a responder: no se genera una nueva notificación ni su recuperación mientras tanto, porque no hay forma de saber si la saturación se mantuvo, se resolvió o empeoró. Esa falta de datos queda señalizada de forma independiente por la alerta `apache_status`, que se activa mientras el endpoint esté inaccesible.
+
 ---
 
 ## 10. Logs Apache multisitio
