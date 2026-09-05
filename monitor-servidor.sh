@@ -1061,6 +1061,22 @@ monitorear_apache() {
     read -r procesos cpu_apache rss_apache_mb < <(medir_procesos_apache)
     conexiones="$(contar_conexiones_apache)"
 
+    # Se evalúa aquí, y no junto a las métricas de server-status, porque
+    # "conexiones" proviene de ss y no depende de mod_status. Si el endpoint
+    # cae, esta alerta debe seguir actualizándose en vez de quedar congelada.
+    if (( conexiones >= UMBRAL_APACHE_CONEXIONES )); then
+        condicion_conexiones=1
+    fi
+
+    gestionar_alerta \
+        "apache_conexiones" \
+        "$condicion_conexiones" \
+        "$TIEMPO_SOSTENIDO_CONEXIONES_APACHE" \
+        "Conexiones Apache altas - ${NOMBRE_SERVIDOR}" \
+        "Conexiones TCP establecidas hacia 80/443=${conexiones}, umbral=${UMBRAL_APACHE_CONEXIONES}." \
+        0 \
+        "Conexiones Apache normalizadas en ${NOMBRE_SERVIDOR}: ${conexiones}."
+
     estado="$(obtener_server_status || true)"
 
     if [[ -z "$estado" ]]; then
@@ -1112,19 +1128,6 @@ monitorear_apache() {
         "BusyWorkers=${busy}/${APACHE_MAX_REQUEST_WORKERS} (${saturacion_pct}%), conexiones=${conexiones}, req/s=${req_por_seg}." \
         1 \
         "Apache dejó la zona de saturación en ${NOMBRE_SERVIDOR}: BusyWorkers=${busy}/${APACHE_MAX_REQUEST_WORKERS} (${saturacion_pct}%)."
-
-    if (( conexiones >= UMBRAL_APACHE_CONEXIONES )); then
-        condicion_conexiones=1
-    fi
-
-    gestionar_alerta \
-        "apache_conexiones" \
-        "$condicion_conexiones" \
-        "$TIEMPO_SOSTENIDO_CONEXIONES_APACHE" \
-        "Conexiones Apache altas - ${NOMBRE_SERVIDOR}" \
-        "Conexiones TCP establecidas hacia 80/443=${conexiones}, umbral=${UMBRAL_APACHE_CONEXIONES}." \
-        0 \
-        "Conexiones Apache normalizadas en ${NOMBRE_SERVIDOR}: ${conexiones}."
 }
 
 ###############################################################################
