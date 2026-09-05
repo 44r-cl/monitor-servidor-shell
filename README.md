@@ -210,6 +210,8 @@ No utilice este modo mientras la tarea CRON esté habilitada.
 sudo /usr/local/sbin/monitor-servidor.sh --probar-alerta
 ```
 
+Requiere `sudo`: `monitor-servidor.conf` tiene permisos `0600 root:root`, y sin privilegios de lectura el comando no puede acceder a `USER_KEY`/`API_TOKEN`. Este modo imprime en pantalla si la notificación se envió o no, junto con la causa del fallo cuando corresponde (config no legible, Pushover deshabilitado, credenciales vacías, etc.).
+
 ### Ayuda
 
 ```bash

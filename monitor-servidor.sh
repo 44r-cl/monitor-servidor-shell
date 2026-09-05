@@ -31,6 +31,9 @@ ARCHIVO_CONFIG="${ARCHIVO_CONFIG:-/etc/monitor-servidor/monitor-servidor.conf}"
 if [[ -r "$ARCHIVO_CONFIG" ]]; then
     # shellcheck source=/dev/null
     source "$ARCHIVO_CONFIG"
+elif [[ -e "$ARCHIVO_CONFIG" ]]; then
+    printf 'ADVERTENCIA: %s existe pero no se puede leer (¿falta sudo?). Se usan valores por defecto, sin credenciales.\n' \
+        "$ARCHIVO_CONFIG" >&2
 fi
 
 # Identificación general.
@@ -2134,10 +2137,24 @@ main() {
             done
             ;;
         --probar-alerta)
-            enviar_pushover \
+            if (( EUID != 0 )); then
+                printf 'ADVERTENCIA: no se ejecuta como root; %s podría no ser legible.\n' "$ARCHIVO_CONFIG" >&2
+            fi
+
+            if [[ "$PUSHOVER_HABILITADO" != "1" ]]; then
+                printf 'PUSHOVER_HABILITADO no está en 1: no se envía ninguna notificación real.\n' >&2
+                exit 1
+            fi
+
+            if enviar_pushover \
                 "Prueba monitor - ${NOMBRE_SERVIDOR}" \
                 "Pushover está configurado correctamente para ${NOMBRE_SERVIDOR}." \
-                0
+                0; then
+                printf 'Notificación de prueba enviada. Revise Pushover.\n'
+            else
+                printf 'No fue posible enviar la notificación de prueba. Detalle en: %s\n' "$ARCHIVO_LOG" >&2
+                exit 1
+            fi
             ;;
         --ayuda|-h|--help)
             mostrar_ayuda
