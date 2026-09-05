@@ -718,6 +718,10 @@ sudo /usr/local/sbin/monitor-servidor.sh --probar-alerta
 
 Las credenciales Pushover son secretos. Mantenga `monitor-servidor.conf` con permisos `0600` y no publique ese archivo en repositorios ni lo distribuya sin eliminar los secretos.
 
+### Ícono de la aplicación Pushover
+
+La carpeta `imagenes/` contiene el ícono usado en la aplicación Pushover asociada a `API_TOKEN` (`monitor-servidor.png`, `monitor-servidor.jpeg` y `monitor-servidor-128x128.png`). Súbalo al configurar o editar la aplicación en el panel de Pushover; no lo utiliza el script en tiempo de ejecución.
+
 ---
 
 ## 14A. Heartbeat externo ("dead man's switch")
