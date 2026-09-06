@@ -49,6 +49,15 @@ SEGUNDOS_ENTRE_REINTENTOS="${SEGUNDOS_ENTRE_REINTENTOS:-2}"
 SEGUNDOS_COOLDOWN_ALERTA="${SEGUNDOS_COOLDOWN_ALERTA:-1800}"
 ALERTAR_RECUPERACION="${ALERTAR_RECUPERACION:-1}"
 
+# ntfy.sh: respaldo si Pushover agota sus reintentos y falla del todo. Solo
+# se intenta en ese momento, no en paralelo con cada notificación normal.
+# NTFY_URL es la URL completa, tópico incluido (funciona igual con el
+# ntfy.sh público que con una instancia propia self-hosted).
+NTFY_HABILITADO="${NTFY_HABILITADO:-0}"
+NTFY_URL="${NTFY_URL:-}"
+NTFY_TOKEN="${NTFY_TOKEN:-}"
+NTFY_TIMEOUT="${NTFY_TIMEOUT:-15}"
+
 # Heartbeat externo ("dead man's switch"). Si el host, el daemon o CRON dejan
 # de ejecutar el monitor, nadie enviaría Pushover para avisarlo. Un servicio
 # externo tipo Healthchecks.io detecta la ausencia de este ping y notifica
@@ -278,6 +287,8 @@ categoria_de_variable() {
     case "$var" in
         USER_KEY|API_TOKEN|PUSHOVER_HABILITADO|PUSHOVER_URL|INTENTOS_PUSHOVER|SEGUNDOS_ENTRE_REINTENTOS|SEGUNDOS_COOLDOWN_ALERTA|ALERTAR_RECUPERACION)
             printf 'Pushover' ;;
+        NTFY_HABILITADO|NTFY_URL|NTFY_TOKEN|NTFY_TIMEOUT)
+            printf 'ntfy.sh (respaldo)' ;;
         HEALTHCHECKS_HABILITADO|HEALTHCHECKS_URL|HEALTHCHECKS_TIMEOUT)
             printf 'Heartbeat externo' ;;
         NOMBRE_SERVIDOR|DIRECTORIO_ESTADO|ARCHIVO_LOG|INTERVALO_DAEMON|MAX_GAP_ESTADO)
@@ -352,7 +363,64 @@ porcentaje() {
     }'
 }
 
-enviar_pushover() {
+# Envía una notificación vía ntfy.sh (público o self-hosted). Un solo
+# intento, sin reintentos propios: se usa como respaldo cuando Pushover ya
+# agotó los suyos, no tiene sentido demorar más la entrega.
+#
+# Argumentos:
+#   1: título.
+#   2: mensaje.
+#   3: prioridad estilo Pushover (0 normal, 1 alta), traducida al header
+#      Priority de ntfy (default/urgent).
+enviar_ntfy() {
+    local titulo="$1"
+    local mensaje="$2"
+    local prioridad="${3:-0}"
+    local prioridad_ntfy="default"
+    local -a cabeceras=()
+
+    if ! booleano_habilitado "$NTFY_HABILITADO"; then
+        return 1
+    fi
+
+    if [[ -z "$NTFY_URL" ]]; then
+        registrar "ERROR" "ntfy" "NTFY_HABILITADO=1 pero NTFY_URL no está configurada."
+        return 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    [[ "$prioridad" == "1" ]] && prioridad_ntfy="urgent"
+
+    cabeceras=(-H "Title: ${titulo}" -H "Priority: ${prioridad_ntfy}")
+    if [[ -n "$NTFY_TOKEN" ]]; then
+        cabeceras+=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+    fi
+
+    if curl --fail --silent --show-error \
+        --connect-timeout 5 \
+        --max-time "$NTFY_TIMEOUT" \
+        --request POST \
+        "${cabeceras[@]}" \
+        --data-binary "$mensaje" \
+        "$NTFY_URL" >/dev/null 2>&1; then
+        registrar "INFO" "ntfy" "Notificación enviada. Título=${titulo}"
+        return 0
+    fi
+
+    registrar "ERROR" "ntfy" "No fue posible enviar la notificación vía ntfy.sh. Título=${titulo}"
+    return 1
+}
+
+# Envía una alerta, priorizando Pushover. Si Pushover está habilitado pero
+# falla genuinamente (credenciales faltantes o los INTENTOS_PUSHOVER
+# reintentos agotados), cae a ntfy.sh como respaldo antes de darse por
+# vencida. No cae a ntfy.sh si Pushover está deshabilitado a propósito
+# (PUSHOVER_HABILITADO=0): eso es una decisión del administrador, no una
+# falla, y redirigir todo en silencio a otro canal sería sorpresivo.
+enviar_notificacion() {
     local titulo="$1"
     local mensaje="$2"
     local prioridad="${3:-0}"
@@ -365,6 +433,10 @@ enviar_pushover() {
 
     if [[ -z "$USER_KEY" || -z "$API_TOKEN" ]]; then
         registrar "ERROR" "pushover" "USER_KEY o API_TOKEN no están configurados."
+        if enviar_ntfy "$titulo" "$mensaje" "$prioridad"; then
+            registrar "WARN" "pushover" "Pushover sin credenciales; ntfy.sh se usó como respaldo. Título=${titulo}"
+            return 0
+        fi
         return 1
     fi
 
@@ -393,6 +465,13 @@ enviar_pushover() {
     done
 
     registrar "ERROR" "pushover" "No fue posible enviar la notificación tras ${INTENTOS_PUSHOVER} intentos."
+
+    if enviar_ntfy "$titulo" "$mensaje" "$prioridad"; then
+        registrar "WARN" "pushover" "Pushover falló tras ${INTENTOS_PUSHOVER} intentos; ntfy.sh se usó como respaldo. Título=${titulo}"
+        return 0
+    fi
+
+    registrar "ERROR" "pushover" "Pushover y ntfy.sh (si estaba habilitado) fallaron ambos. Título=${titulo}"
     return 1
 }
 
@@ -479,7 +558,7 @@ gestionar_alerta() {
 
         if (( duracion >= sostenido )); then
             if (( alertado == 0 || ahora - ultima_alerta >= SEGUNDOS_COOLDOWN_ALERTA )); then
-                if enviar_pushover "$titulo" "$mensaje" "$prioridad"; then
+                if enviar_notificacion "$titulo" "$mensaje" "$prioridad"; then
                     ultima_alerta="$ahora"
                     alertado=1
                 fi
@@ -492,7 +571,7 @@ gestionar_alerta() {
 
     # Condición normal: avisa una sola vez de la recuperación si antes alertó.
     if (( alertado == 1 )) && [[ "$ALERTAR_RECUPERACION" == "1" ]]; then
-        enviar_pushover "RECUPERADO - ${NOMBRE_SERVIDOR}" "$mensaje_recuperacion" 0 || true
+        enviar_notificacion "RECUPERADO - ${NOMBRE_SERVIDOR}" "$mensaje_recuperacion" 0 || true
     fi
 
     rm -f "$archivo_estado"
@@ -779,7 +858,7 @@ alertar_crecimiento_directorio() {
         return 0
     fi
 
-    if enviar_pushover "Crecimiento de directorio - ${NOMBRE_SERVIDOR}" "$mensaje" 1; then
+    if enviar_notificacion "Crecimiento de directorio - ${NOMBRE_SERVIDOR}" "$mensaje" 1; then
         printf '%s\n' "$ahora" > "$archivo_estado"
         printf 'enviado\n'
         return 0
@@ -1089,7 +1168,7 @@ procesar_categoria_log_apache() {
             detalles_pushover="$(printf '%s' "$muestra_errores" \
                 | awk -v hay_mas="$((ocurrencias_nuevas > 3 ? 1 : 0))" 'BEGIN { RS=" \\|\\| " } { detalle=$0; sub(/^(\[[^]]+\][[:space:]]*)+/, "", detalle); if (length(detalle) > 250) detalle=substr(detalle, 1, 247) "..."; printf "%s- %s", (NR > 1 ? "\n" : ""), detalle } END { if (hay_mas) printf "\n… (más entradas en log)" }')"
 
-            if enviar_pushover \
+            if enviar_notificacion \
                 "$titulo_alerta" \
                 "Sitio=${sitio}; categoría=${categoria}; log=${ruta_log}.
 Ocurrencias=${ocurrencias_acumuladas}; umbral=${umbral}.
@@ -1303,7 +1382,7 @@ procesar_intentos_ssh() {
 
         if (( ocurrencias >= UMBRAL_SSH_FALLOS_IP )); then
             if (( ultima_alerta == 0 || ahora - ultima_alerta >= SEGUNDOS_COOLDOWN_SSH_FALLOS_IP )); then
-                if enviar_pushover \
+                if enviar_notificacion \
                     "Posible fuerza bruta SSH - ${NOMBRE_SERVIDOR}" \
                     "IP ${ip}: ${ocurrencias} intentos fallidos en los últimos ${minutos_ventana} min (umbral=${UMBRAL_SSH_FALLOS_IP}). Usuarios probados: ${usuarios_por_ip[$ip]:-desconocido}." \
                     1; then
@@ -2026,7 +2105,7 @@ SQL:
 ${sql_pushover}
 Fingerprint=${fingerprint}"
 
-            if enviar_pushover "$titulo" "$mensaje" 0; then
+            if enviar_notificacion "$titulo" "$mensaje" 0; then
                 ultima_alerta="$ahora"
                 pushover_estado="enviado"
             else
@@ -2584,13 +2663,13 @@ monitorear_cambio_horario() {
     registrar "INFO" "cambio_horario" "fecha_cambio=${FECHA_CAMBIO_HORARIO} ok_sistema=${ok_sistema} ok_php=${ok_php} ok_mysql=${ok_mysql} resumen=${resumen}"
 
     if (( ok_sistema == 1 && ok_php == 1 && ok_mysql == 1 )); then
-        enviar_pushover "Cambio de horario verificado - ${NOMBRE_SERVIDOR}" "$resumen" 0
+        enviar_notificacion "Cambio de horario verificado - ${NOMBRE_SERVIDOR}" "$resumen" 0
         printf '%s|exito\n' "$FECHA_CAMBIO_HORARIO" > "$archivo_estado"
         return 0
     fi
 
     if (( ahora - epoch_cambio >= VENTANA_CAMBIO_HORARIO_SEGUNDOS )); then
-        enviar_pushover "Cambio de horario: verificación fallida - ${NOMBRE_SERVIDOR}" "$resumen" 1
+        enviar_notificacion "Cambio de horario: verificación fallida - ${NOMBRE_SERVIDOR}" "$resumen" 1
         printf '%s|fallo\n' "$FECHA_CAMBIO_HORARIO" > "$archivo_estado"
         return 1
     fi
@@ -2630,6 +2709,7 @@ Uso:
   monitor-servidor.sh --una-vez
   monitor-servidor.sh --daemon
   monitor-servidor.sh --probar-alerta
+  monitor-servidor.sh --probar-ntfy
   monitor-servidor.sh --probar-cambio-horario
   monitor-servidor.sh --diagnostico-config
   monitor-servidor.sh --ayuda
@@ -2641,6 +2721,8 @@ Recomendación:
   - Use --una-vez desde CRON.
   - Use --daemon con nohup o, preferentemente, con systemd.
   - No ejecute CRON y --daemon simultáneamente; el lock evita duplicados.
+  - Use --probar-ntfy para probar el canal de respaldo (ntfy.sh) de forma
+    aislada, sin depender de que Pushover falle realmente.
   - Use --probar-cambio-horario para validar conectividad y formato de las
     3 fuentes (sistema, PHP, MySQL) antes de un cambio de horario real; no
     toca el estado persistente ni depende de FECHA_CAMBIO_HORARIO.
@@ -2678,13 +2760,44 @@ main() {
                 exit 1
             fi
 
-            if enviar_pushover \
+            # Se desactiva el respaldo de ntfy.sh solo para esta prueba: el
+            # objetivo es diagnosticar Pushover específicamente, y si ntfy.sh
+            # rescatara un fallo de Pushover acá, el comando reportaría éxito
+            # sin que Pushover realmente funcione.
+            local NTFY_HABILITADO=0
+
+            if enviar_notificacion \
                 "Prueba monitor - ${NOMBRE_SERVIDOR}" \
                 "Pushover está configurado correctamente para ${NOMBRE_SERVIDOR}." \
                 0; then
                 printf 'Notificación de prueba enviada. Revise Pushover.\n'
             else
                 printf 'No fue posible enviar la notificación de prueba. Detalle en: %s\n' "$ARCHIVO_LOG" >&2
+                exit 1
+            fi
+            ;;
+        --probar-ntfy)
+            if (( EUID != 0 )); then
+                printf 'ADVERTENCIA: no se ejecuta como root; %s podría no ser legible.\n' "$ARCHIVO_CONFIG" >&2
+            fi
+
+            if [[ "$NTFY_HABILITADO" != "1" ]]; then
+                printf 'NTFY_HABILITADO no está en 1: no se envía ninguna notificación real.\n' >&2
+                exit 1
+            fi
+
+            if [[ -z "$NTFY_URL" ]]; then
+                printf 'NTFY_HABILITADO=1 pero NTFY_URL no está configurada.\n' >&2
+                exit 1
+            fi
+
+            if enviar_ntfy \
+                "PRUEBA ntfy.sh - ${NOMBRE_SERVIDOR}" \
+                "ntfy.sh está configurado correctamente para ${NOMBRE_SERVIDOR}. Este canal se usa como respaldo si Pushover falla." \
+                0; then
+                printf 'Notificación de prueba enviada. Revise ntfy.sh (%s).\n' "$NTFY_URL"
+            else
+                printf 'No fue posible enviar la notificación de prueba vía ntfy.sh. Detalle en: %s\n' "$ARCHIVO_LOG" >&2
                 exit 1
             fi
             ;;
@@ -2733,7 +2846,7 @@ main() {
             fi
 
             if [[ "$PUSHOVER_HABILITADO" == "1" ]]; then
-                if enviar_pushover "PRUEBA cambio de horario - ${NOMBRE_SERVIDOR}" "$resumen_prueba" 0; then
+                if enviar_notificacion "PRUEBA cambio de horario - ${NOMBRE_SERVIDOR}" "$resumen_prueba" 0; then
                     printf '\nNotificación de PRUEBA enviada a Pushover (no afecta la verificación real de esta noche).\n'
                 else
                     printf '\nNo fue posible enviar la notificación de PRUEBA a Pushover. Detalle en: %s\n' "$ARCHIVO_LOG" >&2
@@ -2748,10 +2861,11 @@ main() {
         --diagnostico-config)
             local archivo_script_propio="$0"
             local -a excluidas=(ARCHIVO_CONFIG)
-            local -a secretas=(USER_KEY API_TOKEN HEALTHCHECKS_URL)
+            local -a secretas=(USER_KEY API_TOKEN HEALTHCHECKS_URL NTFY_URL NTFY_TOKEN)
             local -a variables=()
             local -a categorias=(
                 "Pushover"
+                "ntfy.sh (respaldo)"
                 "Heartbeat externo"
                 "Estado y ejecución"
                 "Linux / EC2"

@@ -210,7 +210,15 @@ No utilice este modo mientras la tarea CRON esté habilitada.
 sudo /usr/local/sbin/monitor-servidor.sh --probar-alerta
 ```
 
-Requiere `sudo`: `monitor-servidor.conf` tiene permisos `0600 root:root`, y sin privilegios de lectura el comando no puede acceder a `USER_KEY`/`API_TOKEN`. Este modo imprime en pantalla si la notificación se envió o no, junto con la causa del fallo cuando corresponde (config no legible, Pushover deshabilitado, credenciales vacías, etc.).
+Requiere `sudo`: `monitor-servidor.conf` tiene permisos `0600 root:root`, y sin privilegios de lectura el comando no puede acceder a `USER_KEY`/`API_TOKEN`. Este modo imprime en pantalla si la notificación se envió o no, junto con la causa del fallo cuando corresponde (config no legible, Pushover deshabilitado, credenciales vacías, etc.). Prueba Pushover en aislamiento real: si `NTFY_HABILITADO=1`, este modo desactiva el respaldo solo para esta prueba puntual, para que un ntfy.sh funcional no enmascare un fallo real de Pushover.
+
+### Probar ntfy.sh (respaldo)
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --probar-ntfy
+```
+
+Envía una notificación de prueba directamente por ntfy.sh (ver [sección 14B](#14b-respaldo-de-notificaciones-con-ntfysh)), sin pasar por Pushover ni depender de que Pushover falle de verdad.
 
 ### Probar cambio de horario (dry run)
 
@@ -231,21 +239,22 @@ sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
 Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, y las muestra **agrupadas por área funcional**, en este orden:
 
 1. Pushover
-2. Heartbeat externo
-3. Estado y ejecución
-4. Linux / EC2
-5. Disco y crecimiento de directorios
-6. Apache
-7. SSH: fuerza bruta
-8. Certificados TLS
-9. MySQL / RDS
-10. AWS CLI / CloudWatch
-11. Cambio de horario (DST)
-12. Otras (variables futuras que todavía no fueron agregadas a la categorización)
+2. ntfy.sh (respaldo)
+3. Heartbeat externo
+4. Estado y ejecución
+5. Linux / EC2
+6. Disco y crecimiento de directorios
+7. Apache
+8. SSH: fuerza bruta
+9. Certificados TLS
+10. MySQL / RDS
+11. AWS CLI / CloudWatch
+12. Cambio de horario (DST)
+13. Otras (variables futuras que todavía no fueron agregadas a la categorización)
 
 Son las mismas áreas que organiza `monitor-servidor.conf.sample`. Un grupo sin ninguna variable asociada (por ejemplo "Otras", mientras no haga falta) no se muestra. Dentro de cada grupo, cada variable aparece con su valor real (`= valor`) si está configurada explícitamente, o marcada `(valor por defecto: ...)` si está corriendo silenciosamente con el valor embebido en el script, sin una decisión explícita del administrador.
 
-`USER_KEY`, `API_TOKEN` y `HEALTHCHECKS_URL` se muestran enmascarados (solo los primeros caracteres, ej. `abcd...`) porque son secretos: lo suficiente para confirmar visualmente que el valor cargado es el esperado, sin exponerlo completo si la salida se comparte por accidente (un ticket, un chat, una captura de pantalla).
+`USER_KEY`, `API_TOKEN`, `HEALTHCHECKS_URL`, `NTFY_URL` y `NTFY_TOKEN` se muestran enmascarados (solo los primeros caracteres, ej. `abcd...`) porque son secretos: lo suficiente para confirmar visualmente que el valor cargado es el esperado, sin exponerlo completo si la salida se comparte por accidente (un ticket, un chat, una captura de pantalla).
 
 Use este comando después de actualizar `monitor-servidor.sh` (por ejemplo tras un `git pull`) para detectar de inmediato si una funcionalidad nueva quedó a medio configurar, en vez de descubrirlo por un aviso de Pushover que nunca llegó o un `WARN` en el log días después. Termina con código de salida `1` si encuentra alguna variable sin setear, útil para incorporarlo a un chequeo posterior a un despliegue.
 
@@ -856,6 +865,37 @@ Configuración recomendada del lado de Healthchecks.io:
 El ping se envía siempre al final de `ejecutar_revision()`, sin importar si algún check anterior generó una alerta. Su único propósito es certificar que el monitor completó un ciclo; no reemplaza ni depende del resto de las alertas. Un fallo aislado al enviarlo solo se registra como `WARN` en `monitor.log`: no se reintenta, porque la garantía real la aporta el servicio externo al notificar la ausencia de pings, no un reintento local.
 
 `HEALTHCHECKS_URL` actúa como secreto y debe tratarse igual que las credenciales de Pushover o MySQL.
+
+---
+
+## 14B. Respaldo de notificaciones con ntfy.sh
+
+Pushover puede fallar sin que nadie se entere: `enviar_notificacion()` ya reintenta (`INTENTOS_PUSHOVER`) y deja un `ERROR` en `monitor.log` si todos los intentos fallan, pero eso solo se ve si alguien está mirando el log en ese momento. Como Pushover es el único canal de salida, una falla suya (API caída, credenciales revocadas, egress bloqueado hacia ese dominio específico) degrada en silencio **todas** las alertas del monitor a "una línea de log", sin ninguna señal externa.
+
+[ntfy.sh](https://ntfy.sh) sirve como respaldo para ese caso puntual. Se habilita con:
+
+```bash
+NTFY_HABILITADO=1
+NTFY_URL="https://ntfy.sh/un-topico-largo-y-aleatorio"
+NTFY_TOKEN=""
+NTFY_TIMEOUT=15
+```
+
+### Cuándo se usa
+
+Solo cuando Pushover está habilitado (`PUSHOVER_HABILITADO=1`) pero falla genuinamente: credenciales faltantes, o agotó sus `INTENTOS_PUSHOVER` reintentos. **No** se envía en paralelo con cada notificación normal, y **no** se usa como sustituto si Pushover está deshabilitado a propósito (`PUSHOVER_HABILITADO=0`) — eso es una decisión del administrador, no una falla, y redirigir todo en silencio a otro canal sería sorpresivo.
+
+Cuando el respaldo se usa, queda un `WARN` explícito en el log (`"Pushover falló tras N intentos; ntfy.sh se usó como respaldo"`), y si **ambos** canales fallan, un `ERROR` distinto (`"Pushover y ntfy.sh (si estaba habilitado) fallaron ambos"`) — ese sí es el peor caso real: nadie se enteró de nada por ningún canal.
+
+`NTFY_URL` es la URL completa, tópico incluido: funciona igual con el ntfy.sh público que con una instancia propia self-hosted (en cuyo caso `NTFY_TOKEN` permite autenticarse con `Authorization: Bearer`). En el ntfy.sh público, cualquiera que adivine el nombre del tópico puede leer las notificaciones ahí publicadas o publicar mensajes falsos — use un nombre largo y aleatorio, no algo predecible como `monitor-df-ec2`. Trátelo con el mismo cuidado que `HEALTHCHECKS_URL`.
+
+### Probar el respaldo de forma aislada
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --probar-ntfy
+```
+
+Envía una notificación de prueba directamente por ntfy.sh, sin pasar por Pushover ni depender de que Pushover falle de verdad. Es el análogo de `--probar-alerta` para este canal. A su vez, `--probar-alerta` desactiva el respaldo de ntfy.sh solo durante esa prueba puntual, para que un fallo real de Pushover no quede enmascarado por un ntfy.sh que sí funciona.
 
 ---
 

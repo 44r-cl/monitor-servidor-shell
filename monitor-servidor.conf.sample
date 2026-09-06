@@ -18,6 +18,25 @@ SEGUNDOS_COOLDOWN_ALERTA=1800
 ALERTAR_RECUPERACION=1
 
 ###############################################################################
+# ntfy.sh (respaldo si Pushover falla)
+###############################################################################
+
+# Solo se intenta cuando Pushover está habilitado y falla realmente
+# (credenciales faltantes o agotó sus reintentos), no en paralelo con cada
+# notificación normal. NTFY_URL es la URL completa, tópico incluido: sirve
+# tanto para el ntfy.sh público como para una instancia propia self-hosted.
+#
+# En el ntfy.sh público cualquiera que adivine el tópico puede leer sus
+# notificaciones o publicar mensajes falsos ahí: use un nombre largo y
+# aleatorio, no algo predecible como "monitor-df-ec2".
+NTFY_HABILITADO=0
+NTFY_URL="https://ntfy.sh/CAMBIAR-por-un-topico-largo-y-aleatorio"
+
+# Token opcional, solo necesario para instancias self-hosted con auth.
+NTFY_TOKEN=""
+NTFY_TIMEOUT=15
+
+###############################################################################
 # Heartbeat externo ("dead man's switch")
 ###############################################################################
 
