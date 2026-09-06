@@ -173,6 +173,18 @@ UMBRAL_RDS_BURST_BALANCE_PCT="${UMBRAL_RDS_BURST_BALANCE_PCT:-20}"
 UMBRAL_RDS_CONEXIONES="${UMBRAL_RDS_CONEXIONES:-0}"
 TIEMPO_SOSTENIDO_RDS="${TIEMPO_SOSTENIDO_RDS:-300}"
 
+# Verificación puntual de cambio de horario (DST). Confirma, una sola vez por
+# FECHA_CAMBIO_HORARIO configurada, que sistema operativo, PHP (vía Apache) y
+# MySQL reflejen el nuevo offset UTC. Se auto-desactiva marcando esa fecha
+# como procesada en el estado persistente: vuelve a activarse recién cuando
+# se configure una FECHA_CAMBIO_HORARIO distinta para el próximo evento (Chile
+# tiene dos cambios de horario al año, en fechas fijadas por decreto).
+CHECK_CAMBIO_HORARIO_HABILITADO="${CHECK_CAMBIO_HORARIO_HABILITADO:-0}"
+FECHA_CAMBIO_HORARIO="${FECHA_CAMBIO_HORARIO:-}"
+OFFSET_CAMBIO_HORARIO_ESPERADO="${OFFSET_CAMBIO_HORARIO_ESPERADO:-}"
+CAMBIO_HORARIO_PHP_URL="${CAMBIO_HORARIO_PHP_URL:-}"
+VENTANA_CAMBIO_HORARIO_SEGUNDOS="${VENTANA_CAMBIO_HORARIO_SEGUNDOS:-3600}"
+
 ###############################################################################
 # Utilidades
 ###############################################################################
@@ -2128,6 +2140,133 @@ monitorear_aws() {
 }
 
 ###############################################################################
+# Verificación puntual de cambio de horario (DST)
+###############################################################################
+
+# Verifica, una sola vez por FECHA_CAMBIO_HORARIO configurada, que sistema
+# operativo, PHP (vía Apache) y MySQL reflejen el nuevo offset UTC tras un
+# cambio de horario. Se auto-desactiva marcando esa fecha exacta como
+# procesada en el estado persistente: no vuelve a ejecutar los chequeos hasta
+# que se configure una FECHA_CAMBIO_HORARIO distinta para el próximo evento.
+# Si algún chequeo falla, reintenta en cada ejecución de CRON hasta agotar
+# VENTANA_CAMBIO_HORARIO_SEGUNDOS, momento en el que avisa el fracaso y
+# también se marca como procesada para no seguir insistiendo indefinidamente.
+monitorear_cambio_horario() {
+    local archivo_estado="${DIRECTORIO_ESTADO}/cambio_horario.estado"
+    local fecha_procesada="" epoch_cambio ahora
+    local offset_sistema="" offset_php="" offset_mysql="" salida_php
+    local diff_minutos signo abs_min hh mm
+    local ok_sistema=0 ok_php=0 ok_mysql=0
+    local resumen_sistema resumen_php resumen_mysql resumen
+
+    if ! booleano_habilitado "$CHECK_CAMBIO_HORARIO_HABILITADO"; then
+        return 0
+    fi
+
+    if [[ -z "$FECHA_CAMBIO_HORARIO" || -z "$OFFSET_CAMBIO_HORARIO_ESPERADO" || -z "$CAMBIO_HORARIO_PHP_URL" ]]; then
+        registrar "WARN" "cambio_horario" "configuracion_incompleta"
+        return 0
+    fi
+
+    if [[ -r "$archivo_estado" ]]; then
+        IFS='|' read -r fecha_procesada _ < "$archivo_estado" || true
+    fi
+
+    if [[ "$fecha_procesada" == "$FECHA_CAMBIO_HORARIO" ]]; then
+        return 0
+    fi
+
+    epoch_cambio="$(date -d "$FECHA_CAMBIO_HORARIO" +%s 2>/dev/null)"
+    if [[ -z "$epoch_cambio" ]]; then
+        registrar "WARN" "cambio_horario" "fecha_invalida=${FECHA_CAMBIO_HORARIO}"
+        return 0
+    fi
+
+    ahora="$(date +%s)"
+    if (( ahora < epoch_cambio )); then
+        return 0
+    fi
+
+    # 1. Sistema operativo: offset UTC vigente según el propio host.
+    offset_sistema="$(date +%:z)"
+    if [[ "$offset_sistema" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
+        ok_sistema=1
+    fi
+
+    # 2. PHP vía Apache: se espera "AAAA-mm-dd HH:MM:SS|+HH:MM".
+    if salida_php="$(curl --fail --silent --show-error --max-time 10 "$CAMBIO_HORARIO_PHP_URL" 2>/dev/null)"; then
+        offset_php="$(printf '%s' "$salida_php" | cut -d'|' -f2 | tr -d '[:space:]')"
+        if [[ "$offset_php" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
+            ok_php=1
+        fi
+    fi
+
+    # 3. MySQL: la RDS usa time_zone=America/Santiago, por lo que NOW() debe
+    # reflejar el mismo cambio. El offset se calcula por diferencia contra
+    # UTC_TIMESTAMP() en vez de leer @@time_zone, para no depender de si esa
+    # variable devuelve un nombre de zona o un offset numérico.
+    if command -v mysql >/dev/null 2>&1 && [[ -r "$MYSQL_CNF" ]]; then
+        diff_minutos="$(mysql \
+            --defaults-extra-file="$MYSQL_CNF" \
+            --connect-timeout="$MYSQL_TIMEOUT" \
+            --batch --skip-column-names \
+            --execute="SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW());" 2>/dev/null)"
+
+        if [[ "$diff_minutos" =~ ^-?[0-9]+$ ]]; then
+            signo="+"
+            abs_min="$diff_minutos"
+            if (( diff_minutos < 0 )); then
+                signo="-"
+                abs_min=$(( -diff_minutos ))
+            fi
+            hh=$(( abs_min / 60 ))
+            mm=$(( abs_min % 60 ))
+            offset_mysql="$(printf '%s%02d:%02d' "$signo" "$hh" "$mm")"
+
+            if [[ "$offset_mysql" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
+                ok_mysql=1
+            fi
+        fi
+    fi
+
+    if (( ok_sistema == 1 )); then
+        resumen_sistema="OK (${offset_sistema})"
+    else
+        resumen_sistema="FALLO (obtenido=${offset_sistema:-sin_dato})"
+    fi
+
+    if (( ok_php == 1 )); then
+        resumen_php="OK (${offset_php})"
+    else
+        resumen_php="FALLO (obtenido=${offset_php:-sin_respuesta})"
+    fi
+
+    if (( ok_mysql == 1 )); then
+        resumen_mysql="OK (${offset_mysql})"
+    else
+        resumen_mysql="FALLO (obtenido=${offset_mysql:-sin_respuesta})"
+    fi
+
+    resumen="Sistema: ${resumen_sistema}. PHP: ${resumen_php}. MySQL: ${resumen_mysql}. Esperado: ${OFFSET_CAMBIO_HORARIO_ESPERADO}."
+
+    registrar "INFO" "cambio_horario" "fecha_cambio=${FECHA_CAMBIO_HORARIO} ok_sistema=${ok_sistema} ok_php=${ok_php} ok_mysql=${ok_mysql} resumen=${resumen}"
+
+    if (( ok_sistema == 1 && ok_php == 1 && ok_mysql == 1 )); then
+        enviar_pushover "Cambio de horario verificado - ${NOMBRE_SERVIDOR}" "$resumen" 0
+        printf '%s|exito\n' "$FECHA_CAMBIO_HORARIO" > "$archivo_estado"
+        return 0
+    fi
+
+    if (( ahora - epoch_cambio >= VENTANA_CAMBIO_HORARIO_SEGUNDOS )); then
+        enviar_pushover "Cambio de horario: verificación fallida - ${NOMBRE_SERVIDOR}" "$resumen" 1
+        printf '%s|fallo\n' "$FECHA_CAMBIO_HORARIO" > "$archivo_estado"
+        return 1
+    fi
+
+    return 1
+}
+
+###############################################################################
 # Ciclo principal
 ###############################################################################
 
@@ -2142,6 +2281,7 @@ ejecutar_revision() {
     monitorear_mysql
     monitorear_mysql_slow_queries
     monitorear_aws
+    monitorear_cambio_horario
 
     registrar "INFO" "monitor" "fin_revision"
 

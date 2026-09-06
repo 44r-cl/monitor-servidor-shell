@@ -259,3 +259,21 @@ UMBRAL_RDS_CONEXIONES=0
 
 # Duración mínima de la anomalía antes de alertar.
 TIEMPO_SOSTENIDO_RDS=300
+
+###############################################################################
+# Verificación puntual de cambio de horario (DST)
+###############################################################################
+
+# Confirma, una sola vez por FECHA_CAMBIO_HORARIO, que sistema operativo,
+# PHP (vía Apache) y MySQL reflejen el nuevo offset UTC. Se auto-desactiva
+# marcando esa fecha como procesada en el estado persistente: para el
+# próximo cambio de horario (Chile tiene dos al año, por decreto), basta con
+# actualizar FECHA_CAMBIO_HORARIO y OFFSET_CAMBIO_HORARIO_ESPERADO.
+CHECK_CAMBIO_HORARIO_HABILITADO=1
+FECHA_CAMBIO_HORARIO="2026-09-06 00:00:00"
+OFFSET_CAMBIO_HORARIO_ESPERADO="-03:00"
+CAMBIO_HORARIO_PHP_URL="https://www.defacto.cl/monitor-servidor/hora.php"
+
+# Si algún chequeo falla (Apache/MySQL momentáneamente no disponibles),
+# reintenta cada minuto hasta agotar esta ventana desde FECHA_CAMBIO_HORARIO.
+VENTANA_CAMBIO_HORARIO_SEGUNDOS=3600

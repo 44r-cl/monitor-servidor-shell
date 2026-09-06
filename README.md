@@ -266,6 +266,7 @@ Ahí se almacenan, entre otros:
 - último momento de snapshot de directorios;
 - snapshots históricos de tamaño de directorios;
 - cooldown independiente por ruta para alertas de crecimiento;
+- fecha ya verificada del cambio de horario (DST), para no repetir la verificación hasta el próximo evento;
 - lock de ejecución.
 
 No elimine este directorio durante la operación normal. Hacerlo reinicia la memoria persistente del monitor.
@@ -794,6 +795,76 @@ Cuando `UMBRAL_CPU_SISTEMA_PCT` o `UMBRAL_MEMORIA_SISTEMA_PCT` se superan, el mo
 Se registra en cada ejecución donde la condición esté activa, no solo cuando efectivamente se envía Pushover, de modo que el snapshot enviado sea siempre el más cercano posible al momento real del envío.
 
 Solo se incluye el nombre del binario (`comm`), no la línea de comando completa, para no exponer posibles secretos pasados como argumentos a algún proceso.
+
+---
+
+## 15A. Verificación puntual de cambio de horario (DST)
+
+Chile cambia de huso horario dos veces al año, en fechas fijadas por decreto (no siempre coinciden con la regla "de libro" que trae `tzdata`). Esta verificación confirma que, tras el cambio, sistema operativo, PHP (vía Apache) y MySQL/RDS reflejen el nuevo offset UTC — evitando tener que entrar por SSH a comprobarlo manualmente.
+
+Se habilita con:
+
+```bash
+CHECK_CAMBIO_HORARIO_HABILITADO=1
+FECHA_CAMBIO_HORARIO="2026-09-06 00:00:00"
+OFFSET_CAMBIO_HORARIO_ESPERADO="-03:00"
+CAMBIO_HORARIO_PHP_URL="https://www.defacto.cl/monitor-servidor/hora.php"
+VENTANA_CAMBIO_HORARIO_SEGUNDOS=3600
+```
+
+### Mecánica
+
+En cada ejecución de CRON, si ya pasó `FECHA_CAMBIO_HORARIO` y esa fecha exacta todavía no fue marcada como procesada:
+
+1. **Sistema operativo**: compara `date +%:z` contra `OFFSET_CAMBIO_HORARIO_ESPERADO`.
+2. **PHP vía Apache**: hace `curl` a `CAMBIO_HORARIO_PHP_URL`, que debe devolver texto plano con el formato `AAAA-mm-dd HH:MM:SS|+HH:MM` (ver más abajo el contenido de `hora.php`), y compara el segundo campo.
+3. **MySQL/RDS**: ejecuta `SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW());` usando `mysql.cnf`, y convierte la diferencia en minutos a formato `+HH:MM`/`-HH:MM` para compararla. Se calcula por diferencia contra `UTC_TIMESTAMP()` en vez de leer `@@time_zone`, para no depender de si esa variable devuelve un nombre de zona (`America/Santiago`) o un offset numérico.
+
+Si los tres coinciden con `OFFSET_CAMBIO_HORARIO_ESPERADO`, se envía un Pushover de éxito y esa fecha queda marcada como procesada en `/var/lib/monitor-servidor/cambio_horario.estado`: la verificación no se repite hasta que se configure una `FECHA_CAMBIO_HORARIO` distinta (el próximo cambio, típicamente el del año siguiente). Si algo falla, se reintenta en cada ciclo de CRON hasta agotar `VENTANA_CAMBIO_HORARIO_SEGUNDOS` desde `FECHA_CAMBIO_HORARIO`; al agotarse esa ventana sin éxito total, se envía un Pushover de fallo con el detalle de qué chequeo no coincidió, y también se marca como procesada para no reintentar indefinidamente.
+
+Antes de que llegue `FECHA_CAMBIO_HORARIO` la función no hace nada ni deja rastro en el log; no genera ruido mientras espera.
+
+### Página PHP de referencia
+
+Debe existir en el docroot del sitio, por ejemplo:
+
+```text
+/ztrabajo/www/prod/zsitios/defacto.cl/monitor-servidor/hora.php
+```
+
+Con este contenido:
+
+```php
+<?php
+declare(strict_types=1);
+
+function obtenerOffsetChile(): string
+{
+    $zonaHoraria = new DateTimeZone('America/Santiago');
+    $fechaActual = new DateTime('now', $zonaHoraria);
+
+    return $fechaActual->format('P');
+}
+
+$zonaHoraria = new DateTimeZone('America/Santiago');
+$fechaActual = new DateTime('now', $zonaHoraria);
+
+header('Content-Type: text/plain; charset=utf-8');
+printf("%s|%s\n", $fechaActual->format('Y-m-d H:i:s'), obtenerOffsetChile());
+```
+
+Esta página no la instala ni la gestiona `instalar-monitor-servidor.sh`; debe copiarse manualmente al servidor.
+
+### Para el próximo cambio de horario
+
+Basta con actualizar en `monitor-servidor.conf`:
+
+```bash
+FECHA_CAMBIO_HORARIO="<fecha y hora local del próximo cambio>"
+OFFSET_CAMBIO_HORARIO_ESPERADO="<nuevo offset esperado, ej. -04:00 para el cambio a horario de invierno>"
+```
+
+Al ser distinta de la fecha ya marcada como procesada, la verificación se rearma automáticamente sin tocar `CHECK_CAMBIO_HORARIO_HABILITADO` ni ningún otro archivo.
 
 ---
 
