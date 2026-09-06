@@ -2143,6 +2143,55 @@ monitorear_aws() {
 # Verificación puntual de cambio de horario (DST)
 ###############################################################################
 
+# Salida de obtener_offsets_cambio_horario(). Vacío cuando la fuente
+# correspondiente no respondió o no se pudo parsear.
+CAMBIO_HORARIO_OFFSET_SISTEMA=""
+CAMBIO_HORARIO_OFFSET_PHP=""
+CAMBIO_HORARIO_OFFSET_MYSQL=""
+
+# Obtiene el offset UTC vigente según sistema operativo, PHP (vía Apache) y
+# MySQL/RDS, y lo deja en las variables CAMBIO_HORARIO_OFFSET_*. No compara
+# nada contra un valor esperado ni toca el estado persistente: la usan tanto
+# monitorear_cambio_horario() como --probar-cambio-horario.
+obtener_offsets_cambio_horario() {
+    local salida_php diff_minutos signo abs_min hh mm
+
+    # 1. Sistema operativo.
+    CAMBIO_HORARIO_OFFSET_SISTEMA="$(date +%:z)"
+
+    # 2. PHP vía Apache: se espera "AAAA-mm-dd HH:MM:SS|+HH:MM".
+    CAMBIO_HORARIO_OFFSET_PHP=""
+    if [[ -n "$CAMBIO_HORARIO_PHP_URL" ]] \
+        && salida_php="$(curl --fail --silent --show-error --max-time 10 "$CAMBIO_HORARIO_PHP_URL" 2>/dev/null)"; then
+        CAMBIO_HORARIO_OFFSET_PHP="$(printf '%s' "$salida_php" | cut -d'|' -f2 | tr -d '[:space:]')"
+    fi
+
+    # 3. MySQL: la RDS usa time_zone=America/Santiago, por lo que NOW() debe
+    # reflejar el mismo cambio. El offset se calcula por diferencia contra
+    # UTC_TIMESTAMP() en vez de leer @@time_zone, para no depender de si esa
+    # variable devuelve un nombre de zona o un offset numérico.
+    CAMBIO_HORARIO_OFFSET_MYSQL=""
+    if command -v mysql >/dev/null 2>&1 && [[ -r "$MYSQL_CNF" ]]; then
+        diff_minutos="$(mysql \
+            --defaults-extra-file="$MYSQL_CNF" \
+            --connect-timeout="$MYSQL_TIMEOUT" \
+            --batch --skip-column-names \
+            --execute="SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW());" 2>/dev/null)"
+
+        if [[ "$diff_minutos" =~ ^-?[0-9]+$ ]]; then
+            signo="+"
+            abs_min="$diff_minutos"
+            if (( diff_minutos < 0 )); then
+                signo="-"
+                abs_min=$(( -diff_minutos ))
+            fi
+            hh=$(( abs_min / 60 ))
+            mm=$(( abs_min % 60 ))
+            CAMBIO_HORARIO_OFFSET_MYSQL="$(printf '%s%02d:%02d' "$signo" "$hh" "$mm")"
+        fi
+    fi
+}
+
 # Verifica, una sola vez por FECHA_CAMBIO_HORARIO configurada, que sistema
 # operativo, PHP (vía Apache) y MySQL reflejen el nuevo offset UTC tras un
 # cambio de horario. Se auto-desactiva marcando esa fecha exacta como
@@ -2154,8 +2203,6 @@ monitorear_aws() {
 monitorear_cambio_horario() {
     local archivo_estado="${DIRECTORIO_ESTADO}/cambio_horario.estado"
     local fecha_procesada="" epoch_cambio ahora
-    local offset_sistema="" offset_php="" offset_mysql="" salida_php
-    local diff_minutos signo abs_min hh mm
     local ok_sistema=0 ok_php=0 ok_mysql=0
     local resumen_sistema resumen_php resumen_mysql resumen
 
@@ -2187,64 +2234,28 @@ monitorear_cambio_horario() {
         return 0
     fi
 
-    # 1. Sistema operativo: offset UTC vigente según el propio host.
-    offset_sistema="$(date +%:z)"
-    if [[ "$offset_sistema" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
-        ok_sistema=1
-    fi
+    obtener_offsets_cambio_horario
 
-    # 2. PHP vía Apache: se espera "AAAA-mm-dd HH:MM:SS|+HH:MM".
-    if salida_php="$(curl --fail --silent --show-error --max-time 10 "$CAMBIO_HORARIO_PHP_URL" 2>/dev/null)"; then
-        offset_php="$(printf '%s' "$salida_php" | cut -d'|' -f2 | tr -d '[:space:]')"
-        if [[ "$offset_php" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
-            ok_php=1
-        fi
-    fi
-
-    # 3. MySQL: la RDS usa time_zone=America/Santiago, por lo que NOW() debe
-    # reflejar el mismo cambio. El offset se calcula por diferencia contra
-    # UTC_TIMESTAMP() en vez de leer @@time_zone, para no depender de si esa
-    # variable devuelve un nombre de zona o un offset numérico.
-    if command -v mysql >/dev/null 2>&1 && [[ -r "$MYSQL_CNF" ]]; then
-        diff_minutos="$(mysql \
-            --defaults-extra-file="$MYSQL_CNF" \
-            --connect-timeout="$MYSQL_TIMEOUT" \
-            --batch --skip-column-names \
-            --execute="SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW());" 2>/dev/null)"
-
-        if [[ "$diff_minutos" =~ ^-?[0-9]+$ ]]; then
-            signo="+"
-            abs_min="$diff_minutos"
-            if (( diff_minutos < 0 )); then
-                signo="-"
-                abs_min=$(( -diff_minutos ))
-            fi
-            hh=$(( abs_min / 60 ))
-            mm=$(( abs_min % 60 ))
-            offset_mysql="$(printf '%s%02d:%02d' "$signo" "$hh" "$mm")"
-
-            if [[ "$offset_mysql" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
-                ok_mysql=1
-            fi
-        fi
-    fi
+    [[ "$CAMBIO_HORARIO_OFFSET_SISTEMA" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]] && ok_sistema=1
+    [[ "$CAMBIO_HORARIO_OFFSET_PHP" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]] && ok_php=1
+    [[ "$CAMBIO_HORARIO_OFFSET_MYSQL" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]] && ok_mysql=1
 
     if (( ok_sistema == 1 )); then
-        resumen_sistema="OK (${offset_sistema})"
+        resumen_sistema="OK (${CAMBIO_HORARIO_OFFSET_SISTEMA})"
     else
-        resumen_sistema="FALLO (obtenido=${offset_sistema:-sin_dato})"
+        resumen_sistema="FALLO (obtenido=${CAMBIO_HORARIO_OFFSET_SISTEMA:-sin_dato})"
     fi
 
     if (( ok_php == 1 )); then
-        resumen_php="OK (${offset_php})"
+        resumen_php="OK (${CAMBIO_HORARIO_OFFSET_PHP})"
     else
-        resumen_php="FALLO (obtenido=${offset_php:-sin_respuesta})"
+        resumen_php="FALLO (obtenido=${CAMBIO_HORARIO_OFFSET_PHP:-sin_respuesta})"
     fi
 
     if (( ok_mysql == 1 )); then
-        resumen_mysql="OK (${offset_mysql})"
+        resumen_mysql="OK (${CAMBIO_HORARIO_OFFSET_MYSQL})"
     else
-        resumen_mysql="FALLO (obtenido=${offset_mysql:-sin_respuesta})"
+        resumen_mysql="FALLO (obtenido=${CAMBIO_HORARIO_OFFSET_MYSQL:-sin_respuesta})"
     fi
 
     resumen="Sistema: ${resumen_sistema}. PHP: ${resumen_php}. MySQL: ${resumen_mysql}. Esperado: ${OFFSET_CAMBIO_HORARIO_ESPERADO}."
@@ -2296,6 +2307,7 @@ Uso:
   monitor-servidor.sh --una-vez
   monitor-servidor.sh --daemon
   monitor-servidor.sh --probar-alerta
+  monitor-servidor.sh --probar-cambio-horario
   monitor-servidor.sh --ayuda
 
 Variables:
@@ -2305,6 +2317,9 @@ Recomendación:
   - Use --una-vez desde CRON.
   - Use --daemon con nohup o, preferentemente, con systemd.
   - No ejecute CRON y --daemon simultáneamente; el lock evita duplicados.
+  - Use --probar-cambio-horario para validar conectividad y formato de las
+    3 fuentes (sistema, PHP, MySQL) antes de un cambio de horario real; no
+    toca el estado persistente ni depende de FECHA_CAMBIO_HORARIO.
 AYUDA
 }
 
@@ -2345,6 +2360,63 @@ main() {
                 printf 'No fue posible enviar la notificación de prueba. Detalle en: %s\n' "$ARCHIVO_LOG" >&2
                 exit 1
             fi
+            ;;
+        --probar-cambio-horario)
+            local resumen_prueba exito_prueba=1 epoch_cambio_prueba ahora_prueba
+
+            printf 'Probando las 3 fuentes de hora (sistema, PHP vía Apache, MySQL). No toca el estado persistente ni depende de FECHA_CAMBIO_HORARIO.\n\n'
+
+            if [[ -z "$CAMBIO_HORARIO_PHP_URL" ]]; then
+                printf 'ADVERTENCIA: CAMBIO_HORARIO_PHP_URL no está configurada.\n' >&2
+            fi
+
+            obtener_offsets_cambio_horario
+
+            printf 'Sistema operativo : %s\n' "${CAMBIO_HORARIO_OFFSET_SISTEMA:-sin_dato}"
+            printf 'PHP (Apache)      : %s\n' "${CAMBIO_HORARIO_OFFSET_PHP:-sin_respuesta}"
+            printf 'MySQL/RDS         : %s\n' "${CAMBIO_HORARIO_OFFSET_MYSQL:-sin_respuesta}"
+            printf '\n'
+
+            resumen_prueba="Sistema=${CAMBIO_HORARIO_OFFSET_SISTEMA:-sin_dato}; PHP=${CAMBIO_HORARIO_OFFSET_PHP:-sin_respuesta}; MySQL=${CAMBIO_HORARIO_OFFSET_MYSQL:-sin_respuesta}."
+
+            if [[ -z "$CAMBIO_HORARIO_OFFSET_SISTEMA" || -z "$CAMBIO_HORARIO_OFFSET_PHP" || -z "$CAMBIO_HORARIO_OFFSET_MYSQL" ]]; then
+                printf 'FALLO: al menos una fuente no respondió o no se pudo parsear. Revise conectividad, CAMBIO_HORARIO_PHP_URL o mysql.cnf antes del cambio real.\n' >&2
+                exito_prueba=0
+            elif [[ "$CAMBIO_HORARIO_OFFSET_SISTEMA" == "$CAMBIO_HORARIO_OFFSET_PHP" && "$CAMBIO_HORARIO_OFFSET_PHP" == "$CAMBIO_HORARIO_OFFSET_MYSQL" ]]; then
+                printf 'Las tres fuentes coinciden entre sí (%s). Conectividad y formato OK.\n' "$CAMBIO_HORARIO_OFFSET_SISTEMA"
+            else
+                printf 'ADVERTENCIA: las tres fuentes respondieron pero NO coinciden entre sí. Revise cuál está desalineada antes de confiar en la verificación real.\n' >&2
+                exito_prueba=0
+            fi
+
+            if [[ -n "$FECHA_CAMBIO_HORARIO" && -n "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
+                printf '\nOffset esperado tras el cambio (OFFSET_CAMBIO_HORARIO_ESPERADO): %s\n' "$OFFSET_CAMBIO_HORARIO_ESPERADO"
+                epoch_cambio_prueba="$(date -d "$FECHA_CAMBIO_HORARIO" +%s 2>/dev/null)"
+                ahora_prueba="$(date +%s)"
+
+                if [[ -z "$epoch_cambio_prueba" ]]; then
+                    printf 'ADVERTENCIA: FECHA_CAMBIO_HORARIO="%s" no se pudo interpretar.\n' "$FECHA_CAMBIO_HORARIO" >&2
+                elif (( ahora_prueba < epoch_cambio_prueba )); then
+                    printf '(Todavía no llega FECHA_CAMBIO_HORARIO=%s: es normal que hoy no coincida con el offset esperado.)\n' "$FECHA_CAMBIO_HORARIO"
+                elif [[ "$CAMBIO_HORARIO_OFFSET_SISTEMA" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
+                    printf '(El cambio ya está aplicado: el offset actual coincide con el esperado.)\n'
+                else
+                    printf 'ADVERTENCIA: ya pasó FECHA_CAMBIO_HORARIO y el offset actual todavía no coincide con el esperado.\n' >&2
+                fi
+            fi
+
+            if [[ "$PUSHOVER_HABILITADO" == "1" ]]; then
+                if enviar_pushover "PRUEBA cambio de horario - ${NOMBRE_SERVIDOR}" "$resumen_prueba" 0; then
+                    printf '\nNotificación de PRUEBA enviada a Pushover (no afecta la verificación real de esta noche).\n'
+                else
+                    printf '\nNo fue posible enviar la notificación de PRUEBA a Pushover. Detalle en: %s\n' "$ARCHIVO_LOG" >&2
+                    exito_prueba=0
+                fi
+            else
+                printf '\nPUSHOVER_HABILITADO no está en 1: no se envió notificación de prueba.\n' >&2
+            fi
+
+            (( exito_prueba == 1 )) || exit 1
             ;;
         --ayuda|-h|--help)
             mostrar_ayuda

@@ -212,6 +212,16 @@ sudo /usr/local/sbin/monitor-servidor.sh --probar-alerta
 
 Requiere `sudo`: `monitor-servidor.conf` tiene permisos `0600 root:root`, y sin privilegios de lectura el comando no puede acceder a `USER_KEY`/`API_TOKEN`. Este modo imprime en pantalla si la notificación se envió o no, junto con la causa del fallo cuando corresponde (config no legible, Pushover deshabilitado, credenciales vacías, etc.).
 
+### Probar cambio de horario (dry run)
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --probar-cambio-horario
+```
+
+Ejecuta los mismos 3 chequeos que la verificación real (sistema, PHP vía Apache, MySQL — ver [sección 15A](#15a-verificación-puntual-de-cambio-de-horario-dst)), pero **sin depender de `FECHA_CAMBIO_HORARIO` ni tocar el estado persistente**: es seguro correrlo cualquier día, incluso repetidamente, sin riesgo de marcar el evento real como ya procesado. Sirve para validar *antes* del cambio que las tres fuentes son alcanzables y devuelven un formato parseable.
+
+Como todavía no ocurrió el cambio, es normal que el offset actual no coincida con `OFFSET_CAMBIO_HORARIO_ESPERADO`; el comando lo aclara explícitamente. Lo que sí debe cumplirse hoy es que **las tres fuentes coincidan entre sí** (mismo offset entre sistema, PHP y MySQL) — si no coinciden, hay algo que corregir antes de confiar en la verificación real de esta noche. Si `PUSHOVER_HABILITADO=1`, además envía una notificación de prueba con el título `PRUEBA cambio de horario - ...`, para no confundirla con el resultado real.
+
 ### Ayuda
 
 ```bash
@@ -823,6 +833,8 @@ En cada ejecución de CRON, si ya pasó `FECHA_CAMBIO_HORARIO` y esa fecha exact
 Si los tres coinciden con `OFFSET_CAMBIO_HORARIO_ESPERADO`, se envía un Pushover de éxito y esa fecha queda marcada como procesada en `/var/lib/monitor-servidor/cambio_horario.estado`: la verificación no se repite hasta que se configure una `FECHA_CAMBIO_HORARIO` distinta (el próximo cambio, típicamente el del año siguiente). Si algo falla, se reintenta en cada ciclo de CRON hasta agotar `VENTANA_CAMBIO_HORARIO_SEGUNDOS` desde `FECHA_CAMBIO_HORARIO`; al agotarse esa ventana sin éxito total, se envía un Pushover de fallo con el detalle de qué chequeo no coincidió, y también se marca como procesada para no reintentar indefinidamente.
 
 Antes de que llegue `FECHA_CAMBIO_HORARIO` la función no hace nada ni deja rastro en el log; no genera ruido mientras espera.
+
+Para validar conectividad y formato de las 3 fuentes antes del cambio real, sin esperar la fecha ni arriesgar el estado persistente, use `--probar-cambio-horario` (ver [sección 6](#6-modos-de-ejecución)).
 
 ### Página PHP de referencia
 
