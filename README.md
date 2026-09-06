@@ -228,7 +228,7 @@ Como todavía no ocurrió el cambio, es normal que el offset actual no coincida 
 sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
 ```
 
-Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, y muestra dos listas: las **configuradas explícitamente** (con su valor real) y las que están corriendo silenciosamente con el **valor por defecto** embebido en el script, sin una decisión explícita del administrador.
+Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, y las muestra **agrupadas por área funcional** (Pushover, Heartbeat externo, Apache, SSH, Certificados TLS, MySQL / RDS, AWS CLI / CloudWatch, Cambio de horario, etc. — las mismas secciones que organiza `monitor-servidor.conf.sample`). Dentro de cada grupo, cada variable aparece con su valor real (`= valor`) si está configurada explícitamente, o marcada `(valor por defecto: ...)` si está corriendo silenciosamente con el valor embebido en el script, sin una decisión explícita del administrador.
 
 `USER_KEY`, `API_TOKEN` y `HEALTHCHECKS_URL` se muestran enmascarados (solo los primeros caracteres, ej. `abcd...`) porque son secretos: lo suficiente para confirmar visualmente que el valor cargado es el esperado, sin exponerlo completo si la salida se comparte por accidente (un ticket, un chat, una captura de pantalla).
 
@@ -238,6 +238,7 @@ Limitaciones conocidas:
 
 - Solo cubre variables escalares (`VAR="${VAR:-...}"`); no audita arreglos como `APACHE_SITIOS_LOGS`, `SITIOS_TLS` o `RUTAS_DISCO_MONITOREADAS`.
 - No sabe qué variables son relevantes según qué funcionalidades tiene habilitadas: si `CHECK_TLS_HABILITADO=0`, seguirá listando `UMBRAL_TLS_DIAS_RESTANTES` aunque no importe. Es una ayuda para revisar, no un validador estricto.
+- El agrupamiento por categoría (`categoria_de_variable()` en `monitor-servidor.sh`) es una lista curada a mano; una variable nueva que no se agregue ahí cae en "Otras" sin romper nada, pero conviene mantenerla al día junto con cada funcionalidad nueva.
 
 ### Ayuda
 

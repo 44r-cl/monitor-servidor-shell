@@ -266,6 +266,42 @@ enmascarar_secreto() {
     fi
 }
 
+# Asigna cada variable de configuración a la misma categoría que usa
+# monitor-servidor.conf.sample, para que --diagnostico-config pueda agrupar
+# su salida por área funcional. Una variable nueva que no se agregue aquí
+# cae en "Otras" -no rompe nada-, pero conviene mantener esta lista al día
+# cada vez que se agrega una variable nueva.
+categoria_de_variable() {
+    local var="$1"
+
+    case "$var" in
+        USER_KEY|API_TOKEN|PUSHOVER_HABILITADO|PUSHOVER_URL|INTENTOS_PUSHOVER|SEGUNDOS_ENTRE_REINTENTOS|SEGUNDOS_COOLDOWN_ALERTA|ALERTAR_RECUPERACION)
+            printf 'Pushover' ;;
+        HEALTHCHECKS_HABILITADO|HEALTHCHECKS_URL|HEALTHCHECKS_TIMEOUT)
+            printf 'Heartbeat externo' ;;
+        NOMBRE_SERVIDOR|DIRECTORIO_ESTADO|ARCHIVO_LOG|INTERVALO_DAEMON|MAX_GAP_ESTADO)
+            printf 'Estado y ejecución' ;;
+        UMBRAL_CPU_SISTEMA_PCT|TIEMPO_SOSTENIDO_CPU|SEGUNDOS_MUESTRA_CPU|UMBRAL_MEMORIA_SISTEMA_PCT|TIEMPO_SOSTENIDO_MEMORIA|DIAGNOSTICO_PROCESOS_HABILITADO|DIAGNOSTICO_PROCESOS_CANTIDAD)
+            printf 'Linux / EC2' ;;
+        CHECK_ESPACIO_DISCO|UMBRAL_DISCO_USO_PCT|UMBRAL_DISCO_INODOS_PCT|TIEMPO_SOSTENIDO_DISCO|CHECK_CRECIMIENTO_DIRECTORIOS|DIRECTORIO_SNAPSHOTS_DIRECTORIOS|INTERVALO_SNAPSHOT_DIRECTORIOS|VENTANA_CRECIMIENTO_DIRECTORIOS|TOLERANCIA_SNAPSHOT_DIRECTORIOS|RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS|TIMEOUT_DU_DIRECTORIO|SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO)
+            printf 'Disco y crecimiento de directorios' ;;
+        APACHE_SERVICIO|APACHE_PROCESO|APACHE_STATUS_URL|APACHE_HOST_HEADER|APACHE_MAX_REQUEST_WORKERS|UMBRAL_APACHE_SATURACION_PCT|TIEMPO_SOSTENIDO_APACHE|UMBRAL_APACHE_CONEXIONES|TIEMPO_SOSTENIDO_CONEXIONES_APACHE|APACHE_ERROR_LOG|APACHE_ACCESS_LOG|CHECK_CONFIG_ERRORS|REGEX_APACHE_CONFIG_ERROR|UMBRAL_APACHE_CONFIG_ERROR|CHECK_PHP_ERRORS|REGEX_APACHE_PHP_ERROR|UMBRAL_APACHE_PHP_ERROR|CHECK_RESOURCE_ERRORS|REGEX_APACHE_RESOURCE_ERROR|UMBRAL_APACHE_RESOURCE_ERROR|CHECK_HTTP_ERRORS|REGEX_APACHE_HTTP_ERROR|UMBRAL_APACHE_HTTP_ERROR|CHECK_SECURITY_ERRORS|REGEX_APACHE_SECURITY_ERROR|UMBRAL_APACHE_SECURITY_ERROR)
+            printf 'Apache' ;;
+        CHECK_SSH_AUTH_HABILITADO|SSH_AUTH_LOG|UMBRAL_SSH_FALLOS_IP|VENTANA_SSH_FALLOS_IP_SEGUNDOS|SEGUNDOS_COOLDOWN_SSH_FALLOS_IP)
+            printf 'SSH: fuerza bruta' ;;
+        CHECK_TLS_HABILITADO|UMBRAL_TLS_DIAS_RESTANTES|TLS_TIMEOUT_SEGUNDOS|SEGUNDOS_COOLDOWN_TLS)
+            printf 'Certificados TLS' ;;
+        MYSQL_CNF|MYSQL_TIMEOUT|MYSQL_INTENTOS|UMBRAL_MYSQL_CONEXIONES_PCT|UMBRAL_MYSQL_THREADS_RUNNING|TIEMPO_SOSTENIDO_MYSQL|UMBRAL_MYSQL_SLOW_POR_MINUTO|CHECK_MYSQL_SLOW_QUERY_DETAILS|MYSQL_SLOW_QUERY_LOG_GROUP|UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES|VENTANA_MYSQL_SLOW_QUERY_REPETICIONES|SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY|MYSQL_SLOW_QUERY_USUARIOS_BACKUP|UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS|MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS)
+            printf 'MySQL / RDS' ;;
+        AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS)
+            printf 'AWS CLI / CloudWatch' ;;
+        CHECK_CAMBIO_HORARIO_HABILITADO|FECHA_CAMBIO_HORARIO|OFFSET_ANTES_CAMBIO_HORARIO|OFFSET_CAMBIO_HORARIO_ESPERADO|CAMBIO_HORARIO_PHP_URL|VENTANA_CAMBIO_HORARIO_SEGUNDOS)
+            printf 'Cambio de horario (DST)' ;;
+        *)
+            printf 'Otras' ;;
+    esac
+}
+
 registrar() {
     local nivel="$1"
     local evento="$2"
@@ -2688,13 +2724,38 @@ main() {
             local archivo_script_propio="$0"
             local -a excluidas=(ARCHIVO_CONFIG)
             local -a secretas=(USER_KEY API_TOKEN HEALTHCHECKS_URL)
-            local -a lineas_configuradas=() lineas_faltantes=()
-            local var valor_actual faltantes=0 excluida secreta es_secreta
+            local -a variables=()
+            local -a categorias=(
+                "Pushover"
+                "Heartbeat externo"
+                "Estado y ejecución"
+                "Linux / EC2"
+                "Disco y crecimiento de directorios"
+                "Apache"
+                "SSH: fuerza bruta"
+                "Certificados TLS"
+                "MySQL / RDS"
+                "AWS CLI / CloudWatch"
+                "Cambio de horario (DST)"
+                "Otras"
+            )
+            local -a lineas_categoria
+            local var valor_actual faltantes=0 excluida secreta es_secreta categoria
 
             if [[ ! -r "$archivo_script_propio" ]]; then
                 printf 'No se pudo leer el propio script (%s) para enumerar sus variables conocidas.\n' "$archivo_script_propio" >&2
                 exit 1
             fi
+
+            while IFS= read -r var; do
+                [[ -z "$var" ]] && continue
+                for excluida in "${excluidas[@]}"; do
+                    [[ "$var" == "$excluida" ]] && continue 2
+                done
+                variables+=("$var")
+            done < <(grep -oE '^[A-Z][A-Z0-9_]*="\$\{[A-Z][A-Z0-9_]*:-' "$archivo_script_propio" \
+                | sed -E 's/^([A-Z][A-Z0-9_]*)=.*/\1/' \
+                | sort -u)
 
             printf 'Comparando variables conocidas por el script contra %s...\n\n' "$ARCHIVO_CONFIG"
 
@@ -2702,49 +2763,42 @@ main() {
                 printf 'ADVERTENCIA: %s no existe o no es legible; todas las variables corren con su valor por defecto.\n\n' "$ARCHIVO_CONFIG" >&2
             fi
 
-            while IFS= read -r var; do
-                [[ -z "$var" ]] && continue
+            for categoria in "${categorias[@]}"; do
+                lineas_categoria=()
 
-                for excluida in "${excluidas[@]}"; do
-                    [[ "$var" == "$excluida" ]] && continue 2
+                for var in "${variables[@]}"; do
+                    [[ "$(categoria_de_variable "$var")" == "$categoria" ]] || continue
+
+                    valor_actual="${!var}"
+                    es_secreta=0
+                    for secreta in "${secretas[@]}"; do
+                        [[ "$var" == "$secreta" ]] && es_secreta=1 && break
+                    done
+                    if (( es_secreta == 1 )) && [[ -n "$valor_actual" ]]; then
+                        valor_actual="$(enmascarar_secreto "$valor_actual")"
+                    fi
+
+                    if [[ -r "$ARCHIVO_CONFIG" ]] && grep -Eq "^[[:space:]]*${var}=" "$ARCHIVO_CONFIG"; then
+                        lineas_categoria+=("$(printf '  %-45s = %s' "$var" "${valor_actual:-<vacío>}")")
+                    else
+                        faltantes=$((faltantes + 1))
+                        lineas_categoria+=("$(printf '  %-45s (valor por defecto: %s)' "$var" "${valor_actual:-<vacío>}")")
+                    fi
                 done
 
-                valor_actual="${!var}"
-                es_secreta=0
-                for secreta in "${secretas[@]}"; do
-                    [[ "$var" == "$secreta" ]] && es_secreta=1 && break
-                done
+                (( ${#lineas_categoria[@]} == 0 )) && continue
 
-                if (( es_secreta == 1 )) && [[ -n "$valor_actual" ]]; then
-                    valor_actual="$(enmascarar_secreto "$valor_actual")"
-                fi
+                printf -- '-- %s --\n' "$categoria"
+                printf '%s\n' "${lineas_categoria[@]}"
+                printf '\n'
+            done
 
-                if [[ -r "$ARCHIVO_CONFIG" ]] && grep -Eq "^[[:space:]]*${var}=" "$ARCHIVO_CONFIG"; then
-                    lineas_configuradas+=("$(printf '  %-45s = %s' "$var" "${valor_actual:-<vacío>}")")
-                else
-                    faltantes=$((faltantes + 1))
-                    lineas_faltantes+=("$(printf '  %-45s (valor por defecto: %s)' "$var" "${valor_actual:-<vacío>}")")
-                fi
-            done < <(grep -oE '^[A-Z][A-Z0-9_]*="\$\{[A-Z][A-Z0-9_]*:-' "$archivo_script_propio" \
-                | sed -E 's/^([A-Z][A-Z0-9_]*)=.*/\1/' \
-                | sort -u)
+            printf 'Secretos (%s) enmascarados: se muestran solo los primeros caracteres.\n\n' "${secretas[*]}"
 
-            printf 'Configuradas explícitamente (%d):\n' "${#lineas_configuradas[@]}"
-            if (( ${#lineas_configuradas[@]} > 0 )); then
-                printf '%s\n' "${lineas_configuradas[@]}"
-            fi
-            printf '\nSecretos (%s) enmascarados: se muestran solo los primeros caracteres.\n\n' "${secretas[*]}"
-
-            printf 'Usando valor por defecto (%d):\n' "$faltantes"
-            if (( faltantes > 0 )); then
-                printf '%s\n' "${lineas_faltantes[@]}"
-            fi
-
-            printf '\n'
             if (( faltantes == 0 )); then
                 printf 'Todas las variables conocidas están seteadas explícitamente en %s.\n' "$ARCHIVO_CONFIG"
             else
-                printf '%d variable(s) sin setear explícitamente (corriendo con su valor por defecto). Revise si corresponde agregarlas a %s.\n' \
+                printf '%d variable(s) sin setear explícitamente (corriendo con su valor por defecto, marcadas "valor por defecto" arriba). Revise si corresponde agregarlas a %s.\n' \
                     "$faltantes" "$ARCHIVO_CONFIG" >&2
                 printf 'Nota: no incluye arreglos (APACHE_SITIOS_LOGS, SITIOS_TLS, RUTAS_*, etc.), solo variables escalares. Algunas listadas pueden ser irrelevantes si la funcionalidad correspondiente está deshabilitada.\n' >&2
             fi
