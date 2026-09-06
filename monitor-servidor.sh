@@ -2552,6 +2552,7 @@ Uso:
   monitor-servidor.sh --daemon
   monitor-servidor.sh --probar-alerta
   monitor-servidor.sh --probar-cambio-horario
+  monitor-servidor.sh --diagnostico-config
   monitor-servidor.sh --ayuda
 
 Variables:
@@ -2564,6 +2565,9 @@ Recomendación:
   - Use --probar-cambio-horario para validar conectividad y formato de las
     3 fuentes (sistema, PHP, MySQL) antes de un cambio de horario real; no
     toca el estado persistente ni depende de FECHA_CAMBIO_HORARIO.
+  - Use --diagnostico-config después de actualizar el script (ej. git pull)
+    para detectar variables nuevas que el script ya conoce pero todavía no
+    están seteadas explícitamente en monitor-servidor.conf.
 AYUDA
 }
 
@@ -2661,6 +2665,51 @@ main() {
             fi
 
             (( exito_prueba == 1 )) || exit 1
+            ;;
+        --diagnostico-config)
+            local archivo_script_propio="$0"
+            local -a excluidas=(ARCHIVO_CONFIG)
+            local var valor_actual faltantes=0 excluida
+
+            if [[ ! -r "$archivo_script_propio" ]]; then
+                printf 'No se pudo leer el propio script (%s) para enumerar sus variables conocidas.\n' "$archivo_script_propio" >&2
+                exit 1
+            fi
+
+            printf 'Comparando variables conocidas por el script contra %s...\n\n' "$ARCHIVO_CONFIG"
+
+            if [[ ! -r "$ARCHIVO_CONFIG" ]]; then
+                printf 'ADVERTENCIA: %s no existe o no es legible; todas las variables corren con su valor por defecto.\n\n' "$ARCHIVO_CONFIG" >&2
+            fi
+
+            while IFS= read -r var; do
+                [[ -z "$var" ]] && continue
+
+                for excluida in "${excluidas[@]}"; do
+                    [[ "$var" == "$excluida" ]] && continue 2
+                done
+
+                if [[ -r "$ARCHIVO_CONFIG" ]] && grep -Eq "^[[:space:]]*${var}=" "$ARCHIVO_CONFIG"; then
+                    continue
+                fi
+
+                faltantes=$((faltantes + 1))
+                valor_actual="${!var}"
+                printf '  %-45s (valor por defecto: %s)\n' "$var" "${valor_actual:-<vacío>}"
+            done < <(grep -oE '^[A-Z][A-Z0-9_]*="\$\{[A-Z][A-Z0-9_]*:-' "$archivo_script_propio" \
+                | sed -E 's/^([A-Z][A-Z0-9_]*)=.*/\1/' \
+                | sort -u)
+
+            printf '\n'
+            if (( faltantes == 0 )); then
+                printf 'Todas las variables conocidas están seteadas explícitamente en %s.\n' "$ARCHIVO_CONFIG"
+            else
+                printf '%d variable(s) sin setear explícitamente (corriendo con su valor por defecto). Revise si corresponde agregarlas a %s.\n' \
+                    "$faltantes" "$ARCHIVO_CONFIG" >&2
+                printf 'Nota: no incluye arreglos (APACHE_SITIOS_LOGS, SITIOS_TLS, RUTAS_*, etc.), solo variables escalares. Algunas listadas pueden ser irrelevantes si la funcionalidad correspondiente está deshabilitada.\n' >&2
+            fi
+
+            (( faltantes == 0 )) || exit 1
             ;;
         --ayuda|-h|--help)
             mostrar_ayuda

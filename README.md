@@ -222,6 +222,21 @@ Ejecuta los mismos 3 chequeos que la verificación real (sistema, PHP vía Apach
 
 Como todavía no ocurrió el cambio, es normal que el offset actual no coincida con `OFFSET_CAMBIO_HORARIO_ESPERADO`; el comando lo aclara explícitamente. Lo que sí debe cumplirse hoy es que **las tres fuentes coincidan entre sí** (mismo offset entre sistema, PHP y MySQL) — si no coinciden, hay algo que corregir antes de confiar en la verificación real de esta noche. Si `PUSHOVER_HABILITADO=1`, además envía una notificación de prueba con el título `PRUEBA cambio de horario - ...`, para no confundirla con el resultado real.
 
+### Diagnóstico de configuración
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
+```
+
+Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, e imprime cada una que **no** está seteada ahí — es decir, que está corriendo silenciosamente con el valor por defecto embebido en el script, en vez de una decisión explícita del administrador.
+
+Use este comando después de actualizar `monitor-servidor.sh` (por ejemplo tras un `git pull`) para detectar de inmediato si una funcionalidad nueva quedó a medio configurar, en vez de descubrirlo por un aviso de Pushover que nunca llegó o un `WARN` en el log días después. Termina con código de salida `1` si encuentra alguna variable sin setear, útil para incorporarlo a un chequeo posterior a un despliegue.
+
+Limitaciones conocidas:
+
+- Solo cubre variables escalares (`VAR="${VAR:-...}"`); no audita arreglos como `APACHE_SITIOS_LOGS`, `SITIOS_TLS` o `RUTAS_DISCO_MONITOREADAS`.
+- No sabe qué variables son relevantes según qué funcionalidades tiene habilitadas: si `CHECK_TLS_HABILITADO=0`, seguirá listando `UMBRAL_TLS_DIAS_RESTANTES` aunque no importe. Es una ayuda para revisar, no un validador estricto.
+
 ### Ayuda
 
 ```bash
@@ -1140,6 +1155,14 @@ El directorio persistente:
 ```
 
 no se elimina durante una reinstalación, por lo que se conservan cursores, cooldowns y contadores.
+
+**Nota importante:** el instalador reemplaza `monitor-servidor.conf` por completo; no fusiona variables nuevas con la configuración existente. Si en vez de usar el instalador se actualiza `monitor-servidor.conf` a mano (copiando bloques nuevos desde `monitor-servidor.conf.sample`), corra después:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
+```
+
+para confirmar que ninguna variable de una funcionalidad nueva quedó sin setear.
 
 ---
 
