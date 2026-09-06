@@ -502,7 +502,7 @@ Fuera de los logs de Apache, el monitor no tenía visibilidad de intentos de acc
 Se habilita con:
 
 ```bash
-CHECK_SSH_AUTH_HABILITADO=true
+CHECK_SSH_AUTH_HABILITADO=1
 SSH_AUTH_LOG="/var/log/auth.log"
 UMBRAL_SSH_FALLOS_IP=5
 VENTANA_SSH_FALLOS_IP_SEGUNDOS=600
@@ -516,6 +516,43 @@ Si no hay actividad nueva dentro de la ventana configurada, el contador de esa I
 El cursor de lectura sigue el mismo mecanismo que los logs Apache: la primera vez que se encuentra `auth.log` sin cursor previo, se posiciona al final del archivo para no generar una alerta con el historial completo ya existente.
 
 Esta función es **solo de visibilidad, no bloquea IPs**. Si además se quiere banear automáticamente a los atacantes, use `fail2ban` (herramienta dedicada a eso) en paralelo; este monitor no reimplementa esa funcionalidad.
+
+---
+
+## 10B. Vencimiento de certificados TLS
+
+Certbot puede fallar en silencio de varias formas: su timer se desactiva, el hook post-renovación no recarga Apache y el sitio sigue sirviendo el certificado viejo, la validación HTTP-01 se rompe por un cambio de config o de DNS, o se agotan los rate limits de Let's Encrypt. Esta verificación es independiente de certbot: mide directamente cuántos días le quedan al certificado que Apache **realmente está sirviendo**.
+
+Se habilita con:
+
+```bash
+CHECK_TLS_HABILITADO=1
+SITIOS_TLS=(
+    "vitaticket.cl"
+    "vitacuracorporacioncultural.cl"
+    "www.defacto.cl"
+)
+UMBRAL_TLS_DIAS_RESTANTES=14
+TLS_TIMEOUT_SEGUNDOS=10
+SEGUNDOS_COOLDOWN_TLS=86400
+```
+
+### Por qué se conecta a `127.0.0.1`, no al hostname público
+
+El chequeo hace `openssl s_client -connect 127.0.0.1:443 -servername <sitio>`, usando SNI para seleccionar el vhost en vez de resolver `<sitio>` por DNS pública. Dos razones:
+
+1. **Detecta un hook de recarga que falló.** Si certbot renovó el certificado en disco pero el `--deploy-hook` que recarga Apache no corrió, el archivo en disco está al día pero Apache sigue sirviendo el certificado viejo. Leer el archivo directamente no vería el problema; conectarse de verdad sí.
+2. **No depende de que el DNS público siga apuntando a este servidor.** Si se resolviera `<sitio>` por DNS, un cambio de nameservers o de IP haría que el chequeo evalúe el certificado de otro servidor, no el de este. Conectando siempre a `127.0.0.1` se evalúa exactamente lo que este Apache presenta ahora mismo, sin ese intermediario.
+
+Nota: si un dominio ya no se sirve desde este servidor pero su entrada sigue en `SITIOS_TLS`, esto seguiría evaluando el vhost local (si todavía existe) — no detecta por sí solo que un dominio "se mudó" a otro servidor; para eso haría falta un chequeo de resolución DNS aparte, que queda fuera del alcance de esta función.
+
+### Mecánica
+
+Reutiliza `gestionar_alerta()` — el mismo mecanismo que CPU, memoria y disco — en vez de un acumulador propio, porque "días restantes por debajo de un umbral" es exactamente ese patrón: una métrica que sube y baja, con alerta y recuperación. Esto tiene una ventaja concreta: cuando el certificado vuelve a tener vigencia normal (una renovación real, con recarga de Apache incluida), se envía un Pushover de recuperación — es la confirmación positiva de que el problema se resolvió de punta a punta, no solo que certbot corrió.
+
+Se alerta de inmediato (sin esperar un tiempo sostenido) apenas los días restantes caen a `UMBRAL_TLS_DIAS_RESTANTES` o menos, ya que es una métrica que no fluctúa de un minuto a otro. Si `openssl` no logra conectar o no puede parsear el certificado, se trata como la misma condición de alerta: "no se pudo verificar" es tan accionable como "vence pronto".
+
+`SEGUNDOS_COOLDOWN_TLS` es independiente del cooldown global (`SEGUNDOS_COOLDOWN_ALERTA`) y bastante más largo (24 horas por defecto): re-notificar cada 30 minutos durante dos semanas seguidas sería puro ruido. En cambio, un recordatorio diario mientras el problema siga sin resolverse evita que se pierda entre otras notificaciones, a diferencia de un aviso único de certbot que puede pasar desapercibido.
 
 ---
 

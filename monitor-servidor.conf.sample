@@ -178,7 +178,7 @@ UMBRAL_APACHE_SECURITY_ERROR=2
 # (no en total), para no mezclar ruido normal con un ataque concentrado en
 # una sola IP. Es solo visibilidad, no bloquea nada: para eso ya existe
 # fail2ban.
-CHECK_SSH_AUTH_HABILITADO=true
+CHECK_SSH_AUTH_HABILITADO=1
 SSH_AUTH_LOG="/var/log/auth.log"
 
 # Alertar cuando una misma IP acumula 5 fallos en 10 minutos.
@@ -187,6 +187,30 @@ VENTANA_SSH_FALLOS_IP_SEGUNDOS=600
 
 # La misma IP genera como máximo una alerta cada hora mientras siga activa.
 SEGUNDOS_COOLDOWN_SSH_FALLOS_IP=3600
+
+###############################################################################
+# Vencimiento de certificados TLS
+###############################################################################
+
+# Se conecta siempre a 127.0.0.1:443 usando SNI (no se resuelve el hostname
+# por DNS pública), para evaluar el certificado que este Apache realmente
+# está sirviendo ahora mismo, no el archivo en disco. Esto también detecta
+# un hook de recarga de certbot que falló tras una renovación.
+CHECK_TLS_HABILITADO=1
+SITIOS_TLS=(
+    "vitaticket.cl"
+    "vitacuracorporacioncultural.cl"
+    "www.defacto.cl"
+)
+
+# Alertar cuando queden 14 días o menos para el vencimiento.
+UMBRAL_TLS_DIAS_RESTANTES=14
+TLS_TIMEOUT_SEGUNDOS=10
+
+# Cooldown propio, mucho más largo que el global (SEGUNDOS_COOLDOWN_ALERTA):
+# es una métrica que cambia una vez al día, no algo que deba re-notificarse
+# cada 30 minutos. Recordatorio diario mientras el problema persista.
+SEGUNDOS_COOLDOWN_TLS=86400
 
 ###############################################################################
 # MySQL / AWS RDS

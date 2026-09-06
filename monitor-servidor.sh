@@ -141,11 +141,26 @@ REGEX_APACHE_SECURITY_ERROR="${REGEX_APACHE_SECURITY_ERROR:-client denied|AH0163
 # (usuarios que se equivocan de contraseña) con un ataque real concentrado
 # en una sola IP. Es solo visibilidad, no bloquea IPs: para eso ya existe
 # fail2ban.
-CHECK_SSH_AUTH_HABILITADO="${CHECK_SSH_AUTH_HABILITADO:-true}"
+CHECK_SSH_AUTH_HABILITADO="${CHECK_SSH_AUTH_HABILITADO:-1}"
 SSH_AUTH_LOG="${SSH_AUTH_LOG:-/var/log/auth.log}"
 UMBRAL_SSH_FALLOS_IP="${UMBRAL_SSH_FALLOS_IP:-5}"
 VENTANA_SSH_FALLOS_IP_SEGUNDOS="${VENTANA_SSH_FALLOS_IP_SEGUNDOS:-600}"
 SEGUNDOS_COOLDOWN_SSH_FALLOS_IP="${SEGUNDOS_COOLDOWN_SSH_FALLOS_IP:-3600}"
+
+# Vencimiento de certificados TLS. Se conecta siempre a 127.0.0.1:443 usando
+# SNI (no se resuelve el hostname por DNS pública), para evaluar exactamente
+# el certificado que este Apache está sirviendo ahora mismo -no el archivo
+# en disco-, lo cual también detecta un hook de recarga de certbot que falló
+# tras una renovación.
+CHECK_TLS_HABILITADO="${CHECK_TLS_HABILITADO:-1}"
+if ! declare -p SITIOS_TLS >/dev/null 2>&1; then
+    SITIOS_TLS=()
+fi
+UMBRAL_TLS_DIAS_RESTANTES="${UMBRAL_TLS_DIAS_RESTANTES:-14}"
+TLS_TIMEOUT_SEGUNDOS="${TLS_TIMEOUT_SEGUNDOS:-10}"
+# Cooldown propio, mucho más largo que el global: es una métrica que cambia
+# una vez al día, no algo que deba re-notificarse cada 30 minutos.
+SEGUNDOS_COOLDOWN_TLS="${SEGUNDOS_COOLDOWN_TLS:-86400}"
 
 # MySQL/RDS: conexión SQL.
 MYSQL_CNF="${MYSQL_CNF:-/etc/monitor-servidor/mysql.cnf}"
@@ -1262,6 +1277,92 @@ monitorear_ssh_auth() {
     fi
 
     rm -f "$archivo_nuevas"
+}
+
+###############################################################################
+# Vencimiento de certificados TLS
+###############################################################################
+
+# Obtiene la fecha "notAfter" del certificado TLS que Apache sirve
+# actualmente para el hostname indicado. Conecta siempre a 127.0.0.1 y usa
+# SNI para seleccionar el vhost, en vez de resolver el hostname por DNS
+# pública: así se evalúa exactamente lo que este servidor está presentando
+# ahora mismo, sin depender de que el DNS público siga apuntando aquí.
+#
+# Argumentos:
+#   1: hostname a usar como SNI.
+obtener_fecha_expiracion_tls() {
+    local sitio="$1"
+    local -a comando=(openssl s_client -connect "127.0.0.1:443" -servername "$sitio")
+
+    if ! command -v openssl >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if command -v timeout >/dev/null 2>&1; then
+        comando=(timeout "$TLS_TIMEOUT_SEGUNDOS" "${comando[@]}")
+    fi
+
+    "${comando[@]}" </dev/null 2>/dev/null \
+        | openssl x509 -noout -enddate 2>/dev/null \
+        | sed -n 's/^notAfter=//p'
+}
+
+# Verifica, para cada sitio en SITIOS_TLS, cuántos días quedan antes de que
+# venza el certificado TLS realmente servido. Reutiliza gestionar_alerta()
+# -mismo patrón que CPU/memoria/disco-, por lo que además de alertar cuando
+# quedan pocos días, notifica la recuperación cuando el certificado vuelve a
+# tener vigencia normal: es la confirmación de que una renovación reciente
+# realmente se aplicó (certbot + recarga de Apache), no solo que se ejecutó.
+monitorear_certificados_tls() {
+    local sitio sitio_clave enddate epoch_fin ahora dias_restantes condicion mensaje
+    local SEGUNDOS_COOLDOWN_ALERTA="$SEGUNDOS_COOLDOWN_TLS"
+
+    if ! booleano_habilitado "$CHECK_TLS_HABILITADO"; then
+        return 0
+    fi
+
+    for sitio in "${SITIOS_TLS[@]}"; do
+        [[ -z "$sitio" ]] && continue
+        sitio_clave="$(printf '%s' "$sitio" | sed 's/[^[:alnum:]_-]/_/g')"
+        condicion=0
+
+        enddate="$(obtener_fecha_expiracion_tls "$sitio")"
+
+        if [[ -z "$enddate" ]]; then
+            registrar "WARN" "tls" "sitio=${sitio} estado=no_se_pudo_obtener_certificado"
+            condicion=1
+            mensaje="No fue posible obtener el certificado TLS de ${sitio} conectando a 127.0.0.1:443 con SNI=${sitio}. Revise Apache/mod_ssl para ese vhost."
+        else
+            epoch_fin="$(date -d "$enddate" +%s 2>/dev/null)"
+
+            if [[ -z "$epoch_fin" ]]; then
+                registrar "WARN" "tls" "sitio=${sitio} estado=fecha_no_parseable valor=${enddate}"
+                condicion=1
+                mensaje="No fue posible interpretar la fecha de expiración del certificado de ${sitio}: ${enddate}."
+            else
+                ahora="$(date +%s)"
+                dias_restantes=$(( (epoch_fin - ahora) / 86400 ))
+
+                registrar "INFO" "tls" "sitio=${sitio} dias_restantes=${dias_restantes} vencimiento=${enddate}"
+
+                if (( dias_restantes <= UMBRAL_TLS_DIAS_RESTANTES )); then
+                    condicion=1
+                fi
+
+                mensaje="Certificado TLS de ${sitio}: ${dias_restantes} días restantes (vence ${enddate}). Umbral=${UMBRAL_TLS_DIAS_RESTANTES} días."
+            fi
+        fi
+
+        gestionar_alerta \
+            "tls_${sitio_clave}" \
+            "$condicion" \
+            0 \
+            "Certificado TLS por vencer - ${NOMBRE_SERVIDOR}" \
+            "$mensaje" \
+            1 \
+            "Certificado TLS de ${sitio} normalizado en ${NOMBRE_SERVIDOR}."
+    done
 }
 
 monitorear_apache() {
@@ -2431,6 +2532,7 @@ ejecutar_revision() {
     monitorear_apache
     analyze_logs
     monitorear_ssh_auth
+    monitorear_certificados_tls
     monitorear_mysql
     monitorear_mysql_slow_queries
     monitorear_aws
