@@ -136,6 +136,17 @@ CHECK_SECURITY_ERRORS="${CHECK_SECURITY_ERRORS:-true}"
 UMBRAL_APACHE_SECURITY_ERROR="${UMBRAL_APACHE_SECURITY_ERROR:-2}"
 REGEX_APACHE_SECURITY_ERROR="${REGEX_APACHE_SECURITY_ERROR:-client denied|AH01630.*client denied|authentication failure}"
 
+# SSH: intentos de fuerza bruta. Se cuentan las líneas "Failed password" de
+# auth.log agrupadas por IP origen, no en total, para no mezclar ruido normal
+# (usuarios que se equivocan de contraseña) con un ataque real concentrado
+# en una sola IP. Es solo visibilidad, no bloquea IPs: para eso ya existe
+# fail2ban.
+CHECK_SSH_AUTH_HABILITADO="${CHECK_SSH_AUTH_HABILITADO:-true}"
+SSH_AUTH_LOG="${SSH_AUTH_LOG:-/var/log/auth.log}"
+UMBRAL_SSH_FALLOS_IP="${UMBRAL_SSH_FALLOS_IP:-5}"
+VENTANA_SSH_FALLOS_IP_SEGUNDOS="${VENTANA_SSH_FALLOS_IP_SEGUNDOS:-600}"
+SEGUNDOS_COOLDOWN_SSH_FALLOS_IP="${SEGUNDOS_COOLDOWN_SSH_FALLOS_IP:-3600}"
+
 # MySQL/RDS: conexión SQL.
 MYSQL_CNF="${MYSQL_CNF:-/etc/monitor-servidor/mysql.cnf}"
 MYSQL_TIMEOUT="${MYSQL_TIMEOUT:-5}"
@@ -1142,6 +1153,115 @@ analyze_logs() {
 
         rm -f "$archivo_nuevas_error" "$archivo_nuevas_access"
     done
+}
+
+###############################################################################
+# SSH: intentos de fuerza bruta
+###############################################################################
+
+# Procesa las líneas "Failed password" nuevas de auth.log, agregadas por IP
+# origen dentro de la ejecución actual, y actualiza el acumulador persistente
+# de cada IP. Si una misma IP acumula UMBRAL_SSH_FALLOS_IP fallos dentro de
+# VENTANA_SSH_FALLOS_IP_SEGUNDOS, alerta por Pushover respetando un cooldown
+# independiente por IP. Solo informa; no bloquea nada.
+#
+# Argumentos:
+#   1: archivo con las líneas nuevas de auth.log.
+procesar_intentos_ssh() {
+    local archivo_nuevas="$1"
+    local ip clave archivo_estado
+    local ventana_inicio ocurrencias ultima_alerta ahora minutos_ventana
+    local -A conteo_por_ip=()
+    local -A usuarios_por_ip=()
+
+    while IFS=$'\t' read -r ip usuario; do
+        [[ -z "$ip" ]] && continue
+        conteo_por_ip["$ip"]=$(( ${conteo_por_ip["$ip"]:-0} + 1 ))
+
+        if [[ -z "${usuarios_por_ip[$ip]:-}" ]]; then
+            usuarios_por_ip["$ip"]="$usuario"
+        elif [[ "${usuarios_por_ip[$ip]}" != *"$usuario"* \
+            && $(printf '%s' "${usuarios_por_ip[$ip]}" | awk -F', ' '{print NF}') -lt 3 ]]; then
+            usuarios_por_ip["$ip"]="${usuarios_por_ip[$ip]}, ${usuario}"
+        fi
+    done < <(awk '
+        /Failed password/ {
+            ip = ""; usuario = "";
+            for (i = 1; i <= NF; i++) {
+                if ($i == "from") { ip = $(i + 1) }
+            }
+            for (i = 1; i <= NF; i++) {
+                if ($i == "for") {
+                    if ($(i + 1) == "invalid" && $(i + 2) == "user") {
+                        usuario = $(i + 3)
+                    } else {
+                        usuario = $(i + 1)
+                    }
+                    break
+                }
+            }
+            if (ip != "") print ip "\t" usuario
+        }
+    ' "$archivo_nuevas")
+
+    ahora="$(date +%s)"
+    minutos_ventana=$(( VENTANA_SSH_FALLOS_IP_SEGUNDOS / 60 ))
+
+    for ip in "${!conteo_por_ip[@]}"; do
+        clave="$(printf '%s' "$ip" | cksum | awk '{print $1}')"
+        archivo_estado="${DIRECTORIO_ESTADO}/ssh_fallos_${clave}.estado"
+        ventana_inicio=0
+        ocurrencias=0
+        ultima_alerta=0
+
+        if [[ -r "$archivo_estado" ]]; then
+            IFS='|' read -r ventana_inicio ocurrencias ultima_alerta < "$archivo_estado" || true
+        fi
+
+        [[ "$ventana_inicio" =~ ^[0-9]+$ ]] || ventana_inicio=0
+        [[ "$ocurrencias" =~ ^[0-9]+$ ]] || ocurrencias=0
+        [[ "$ultima_alerta" =~ ^[0-9]+$ ]] || ultima_alerta=0
+
+        if (( ventana_inicio == 0 || ahora - ventana_inicio > VENTANA_SSH_FALLOS_IP_SEGUNDOS )); then
+            ventana_inicio="$ahora"
+            ocurrencias=0
+        fi
+
+        ocurrencias=$(( ocurrencias + conteo_por_ip["$ip"] ))
+
+        registrar "WARN" "ssh_auth" "ip=${ip} fallos_nuevos=${conteo_por_ip[$ip]} fallos_ventana=${ocurrencias} umbral=${UMBRAL_SSH_FALLOS_IP} ventana_min=${minutos_ventana} usuarios=${usuarios_por_ip[$ip]:-desconocido}"
+
+        if (( ocurrencias >= UMBRAL_SSH_FALLOS_IP )); then
+            if (( ultima_alerta == 0 || ahora - ultima_alerta >= SEGUNDOS_COOLDOWN_SSH_FALLOS_IP )); then
+                if enviar_pushover \
+                    "Posible fuerza bruta SSH - ${NOMBRE_SERVIDOR}" \
+                    "IP ${ip}: ${ocurrencias} intentos fallidos en los últimos ${minutos_ventana} min (umbral=${UMBRAL_SSH_FALLOS_IP}). Usuarios probados: ${usuarios_por_ip[$ip]:-desconocido}." \
+                    1; then
+                    ultima_alerta="$ahora"
+                fi
+            fi
+        fi
+
+        printf '%s|%s|%s\n' "$ventana_inicio" "$ocurrencias" "$ultima_alerta" > "$archivo_estado"
+    done
+}
+
+# Analiza SSH_AUTH_LOG en busca de intentos fallidos nuevos. Reutiliza
+# obtener_lineas_nuevas_log_apache() para el cursor incremental: su firma ya
+# es genérica (ruta de log + evento a registrar), pese al nombre heredado de
+# cuando solo se usaba para logs Apache.
+monitorear_ssh_auth() {
+    local archivo_nuevas="${DIRECTORIO_ESTADO}/ssh_auth_nuevas.$$"
+
+    if ! booleano_habilitado "$CHECK_SSH_AUTH_HABILITADO"; then
+        return 0
+    fi
+
+    if obtener_lineas_nuevas_log_apache "ssh" "auth" "$SSH_AUTH_LOG" "$archivo_nuevas" "ssh_auth"; then
+        procesar_intentos_ssh "$archivo_nuevas"
+    fi
+
+    rm -f "$archivo_nuevas"
 }
 
 monitorear_apache() {
@@ -2310,6 +2430,7 @@ ejecutar_revision() {
     monitorear_crecimiento_directorios
     monitorear_apache
     analyze_logs
+    monitorear_ssh_auth
     monitorear_mysql
     monitorear_mysql_slow_queries
     monitorear_aws

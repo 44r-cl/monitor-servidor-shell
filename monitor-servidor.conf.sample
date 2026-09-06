@@ -171,6 +171,24 @@ REGEX_APACHE_SECURITY_ERROR='client denied|AH01630.*client denied|authentication
 UMBRAL_APACHE_SECURITY_ERROR=2
 
 ###############################################################################
+# SSH: intentos de fuerza bruta
+###############################################################################
+
+# Cuenta las líneas "Failed password" de auth.log agrupadas por IP origen
+# (no en total), para no mezclar ruido normal con un ataque concentrado en
+# una sola IP. Es solo visibilidad, no bloquea nada: para eso ya existe
+# fail2ban.
+CHECK_SSH_AUTH_HABILITADO=true
+SSH_AUTH_LOG="/var/log/auth.log"
+
+# Alertar cuando una misma IP acumula 5 fallos en 10 minutos.
+UMBRAL_SSH_FALLOS_IP=5
+VENTANA_SSH_FALLOS_IP_SEGUNDOS=600
+
+# La misma IP genera como máximo una alerta cada hora mientras siga activa.
+SEGUNDOS_COOLDOWN_SSH_FALLOS_IP=3600
+
+###############################################################################
 # MySQL / AWS RDS
 ###############################################################################
 

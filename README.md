@@ -277,6 +277,7 @@ Ahí se almacenan, entre otros:
 - snapshots históricos de tamaño de directorios;
 - cooldown independiente por ruta para alertas de crecimiento;
 - fecha ya verificada del cambio de horario (DST), para no repetir la verificación hasta el próximo evento;
+- cursor de lectura de `auth.log` y acumulador de fallos SSH con cooldown por IP;
 - lock de ejecución.
 
 No elimine este directorio durante la operación normal. Hacerlo reinicia la memoria persistente del monitor.
@@ -491,6 +492,30 @@ UMBRAL_APACHE_PHP_ERROR=1
 `PHP Warning`, `PHP Notice` y mensajes `Deprecated` quedan fuera de esta categoría por defecto para reducir ruido. Pueden incorporarse posteriormente ajustando la expresión regular en `monitor-servidor.conf` si se desea vigilarlos.
 
 Cada `sitio + categoría` mantiene su contador independiente y cada `sitio + tipo de log` mantiene su propio cursor. Configuración Apache y PHP / Aplicación utilizan claves de estado separadas, por lo que sus ocurrencias no se mezclan.
+
+---
+
+## 10A. SSH: intentos de fuerza bruta
+
+Fuera de los logs de Apache, el monitor no tenía visibilidad de intentos de acceso al propio host. Esta función cuenta las líneas `Failed password` de `auth.log`, agrupadas por IP origen, para detectar fuerza bruta contra SSH.
+
+Se habilita con:
+
+```bash
+CHECK_SSH_AUTH_HABILITADO=true
+SSH_AUTH_LOG="/var/log/auth.log"
+UMBRAL_SSH_FALLOS_IP=5
+VENTANA_SSH_FALLOS_IP_SEGUNDOS=600
+SEGUNDOS_COOLDOWN_SSH_FALLOS_IP=3600
+```
+
+El conteo es **por IP**, no un total global: 50 fallos repartidos entre 50 usuarios que se equivocaron de contraseña es ruido, mientras que 5 fallos desde una sola IP en 10 minutos es un patrón de ataque. Cuando una misma IP acumula `UMBRAL_SSH_FALLOS_IP` fallos dentro de `VENTANA_SSH_FALLOS_IP_SEGUNDOS`, se envía un Pushover con la IP, la cantidad de intentos y hasta 3 nombres de usuario distintos probados. Esa IP respeta además un cooldown independiente (`SEGUNDOS_COOLDOWN_SSH_FALLOS_IP`): mientras el ataque siga activo, no se manda más de una alerta por hora para la misma IP.
+
+Si no hay actividad nueva dentro de la ventana configurada, el contador de esa IP se reinicia en la siguiente ocurrencia; no se acumula indefinidamente a lo largo de días.
+
+El cursor de lectura sigue el mismo mecanismo que los logs Apache: la primera vez que se encuentra `auth.log` sin cursor previo, se posiciona al final del archivo para no generar una alerta con el historial completo ya existente.
+
+Esta función es **solo de visibilidad, no bloquea IPs**. Si además se quiere banear automáticamente a los atacantes, use `fail2ban` (herramienta dedicada a eso) en paralelo; este monitor no reimplementa esa funcionalidad.
 
 ---
 
