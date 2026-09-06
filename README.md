@@ -228,7 +228,22 @@ Como todavía no ocurrió el cambio, es normal que el offset actual no coincida 
 sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
 ```
 
-Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, y las muestra **agrupadas por área funcional** (Pushover, Heartbeat externo, Apache, SSH, Certificados TLS, MySQL / RDS, AWS CLI / CloudWatch, Cambio de horario, etc. — las mismas secciones que organiza `monitor-servidor.conf.sample`). Dentro de cada grupo, cada variable aparece con su valor real (`= valor`) si está configurada explícitamente, o marcada `(valor por defecto: ...)` si está corriendo silenciosamente con el valor embebido en el script, sin una decisión explícita del administrador.
+Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, y las muestra **agrupadas por área funcional**, en este orden:
+
+1. Pushover
+2. Heartbeat externo
+3. Estado y ejecución
+4. Linux / EC2
+5. Disco y crecimiento de directorios
+6. Apache
+7. SSH: fuerza bruta
+8. Certificados TLS
+9. MySQL / RDS
+10. AWS CLI / CloudWatch
+11. Cambio de horario (DST)
+12. Otras (variables futuras que todavía no fueron agregadas a la categorización)
+
+Son las mismas áreas que organiza `monitor-servidor.conf.sample`. Un grupo sin ninguna variable asociada (por ejemplo "Otras", mientras no haga falta) no se muestra. Dentro de cada grupo, cada variable aparece con su valor real (`= valor`) si está configurada explícitamente, o marcada `(valor por defecto: ...)` si está corriendo silenciosamente con el valor embebido en el script, sin una decisión explícita del administrador.
 
 `USER_KEY`, `API_TOKEN` y `HEALTHCHECKS_URL` se muestran enmascarados (solo los primeros caracteres, ej. `abcd...`) porque son secretos: lo suficiente para confirmar visualmente que el valor cargado es el esperado, sin exponerlo completo si la salida se comparte por accidente (un ticket, un chat, una captura de pantalla).
 
