@@ -181,6 +181,12 @@ TIEMPO_SOSTENIDO_RDS="${TIEMPO_SOSTENIDO_RDS:-300}"
 # tiene dos cambios de horario al año, en fechas fijadas por decreto).
 CHECK_CAMBIO_HORARIO_HABILITADO="${CHECK_CAMBIO_HORARIO_HABILITADO:-0}"
 FECHA_CAMBIO_HORARIO="${FECHA_CAMBIO_HORARIO:-}"
+# Offset vigente justo ANTES del cambio. Es necesario para interpretar
+# FECHA_CAMBIO_HORARIO sin ambigüedad: en un adelanto de reloj, el instante
+# configurado (ej. "00:00:00") es una hora local que nunca llega a existir
+# -salta directo a la 01:00:00-, así que "date -d" no puede resolverla sola
+# si el sistema ya está corriendo en esa misma zona horaria.
+OFFSET_ANTES_CAMBIO_HORARIO="${OFFSET_ANTES_CAMBIO_HORARIO:-}"
 OFFSET_CAMBIO_HORARIO_ESPERADO="${OFFSET_CAMBIO_HORARIO_ESPERADO:-}"
 CAMBIO_HORARIO_PHP_URL="${CAMBIO_HORARIO_PHP_URL:-}"
 VENTANA_CAMBIO_HORARIO_SEGUNDOS="${VENTANA_CAMBIO_HORARIO_SEGUNDOS:-3600}"
@@ -2192,6 +2198,21 @@ obtener_offsets_cambio_horario() {
     fi
 }
 
+# Convierte FECHA_CAMBIO_HORARIO a epoch. Si OFFSET_ANTES_CAMBIO_HORARIO está
+# configurado, ancla la interpretación a ese offset en vez de dejar que
+# "date -d" use la zona horaria vigente del sistema: en un adelanto de reloj,
+# el instante configurado (ej. "00:00:00") es una hora local que nunca llega
+# a existir -salta directo a la 01:00:00-, y "date -d" la rechaza como fecha
+# inválida si el sistema ya está corriendo en esa misma zona horaria.
+# Imprime el epoch por stdout, o nada si no se pudo interpretar.
+epoch_cambio_horario() {
+    if [[ -n "$OFFSET_ANTES_CAMBIO_HORARIO" ]]; then
+        date -d "${FECHA_CAMBIO_HORARIO} ${OFFSET_ANTES_CAMBIO_HORARIO}" +%s 2>/dev/null
+    else
+        date -d "$FECHA_CAMBIO_HORARIO" +%s 2>/dev/null
+    fi
+}
+
 # Verifica, una sola vez por FECHA_CAMBIO_HORARIO configurada, que sistema
 # operativo, PHP (vía Apache) y MySQL reflejen el nuevo offset UTC tras un
 # cambio de horario. Se auto-desactiva marcando esa fecha exacta como
@@ -2223,9 +2244,9 @@ monitorear_cambio_horario() {
         return 0
     fi
 
-    epoch_cambio="$(date -d "$FECHA_CAMBIO_HORARIO" +%s 2>/dev/null)"
+    epoch_cambio="$(epoch_cambio_horario)"
     if [[ -z "$epoch_cambio" ]]; then
-        registrar "WARN" "cambio_horario" "fecha_invalida=${FECHA_CAMBIO_HORARIO}"
+        registrar "WARN" "cambio_horario" "fecha_invalida=${FECHA_CAMBIO_HORARIO} offset_antes=${OFFSET_ANTES_CAMBIO_HORARIO:-no_configurado}"
         return 0
     fi
 
@@ -2391,11 +2412,11 @@ main() {
 
             if [[ -n "$FECHA_CAMBIO_HORARIO" && -n "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then
                 printf '\nOffset esperado tras el cambio (OFFSET_CAMBIO_HORARIO_ESPERADO): %s\n' "$OFFSET_CAMBIO_HORARIO_ESPERADO"
-                epoch_cambio_prueba="$(date -d "$FECHA_CAMBIO_HORARIO" +%s 2>/dev/null)"
+                epoch_cambio_prueba="$(epoch_cambio_horario)"
                 ahora_prueba="$(date +%s)"
 
                 if [[ -z "$epoch_cambio_prueba" ]]; then
-                    printf 'ADVERTENCIA: FECHA_CAMBIO_HORARIO="%s" no se pudo interpretar.\n' "$FECHA_CAMBIO_HORARIO" >&2
+                    printf 'ADVERTENCIA: FECHA_CAMBIO_HORARIO="%s" no se pudo interpretar (offset_antes=%s). Si la hora configurada cae justo en el hueco del cambio (ej. "00:00:00" en un adelanto de reloj), configure OFFSET_ANTES_CAMBIO_HORARIO.\n' "$FECHA_CAMBIO_HORARIO" "${OFFSET_ANTES_CAMBIO_HORARIO:-no_configurado}" >&2
                 elif (( ahora_prueba < epoch_cambio_prueba )); then
                     printf '(Todavía no llega FECHA_CAMBIO_HORARIO=%s: es normal que hoy no coincida con el offset esperado.)\n' "$FECHA_CAMBIO_HORARIO"
                 elif [[ "$CAMBIO_HORARIO_OFFSET_SISTEMA" == "$OFFSET_CAMBIO_HORARIO_ESPERADO" ]]; then

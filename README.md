@@ -817,14 +817,25 @@ Se habilita con:
 ```bash
 CHECK_CAMBIO_HORARIO_HABILITADO=1
 FECHA_CAMBIO_HORARIO="2026-09-06 00:00:00"
+OFFSET_ANTES_CAMBIO_HORARIO="-04:00"
 OFFSET_CAMBIO_HORARIO_ESPERADO="-03:00"
 CAMBIO_HORARIO_PHP_URL="https://www.defacto.cl/monitor-servidor/hora.php"
 VENTANA_CAMBIO_HORARIO_SEGUNDOS=3600
 ```
 
+### `OFFSET_ANTES_CAMBIO_HORARIO`: por qué es obligatorio en un adelanto de reloj
+
+En un adelanto de reloj, el instante configurado en `FECHA_CAMBIO_HORARIO` (típicamente `00:00:00`) es una hora local que **nunca llega a existir**: el reloj salta directo de las 00:00:00 a las 01:00:00. Si el propio host ya corre en esa zona horaria, `date -d "2026-09-06 00:00:00"` la rechaza como fecha inválida, porque no hay forma de ubicar ese instante en la línea de tiempo local sin más contexto — y el monitor lo registra como:
+
+```text
+WARN ... [cambio_horario] fecha_invalida=2026-09-06 00:00:00
+```
+
+`OFFSET_ANTES_CAMBIO_HORARIO` resuelve la ambigüedad ancorando la fecha al offset que regía justo antes del cambio (`date -d "2026-09-06 00:00:00 -04:00"`), en vez de dejar que `date` intente adivinarlo con la zona horaria vigente del sistema en ese momento. Para el cambio a horario de invierno (retraso de reloj) esto no es estrictamente necesario porque ahí no hay hueco, solo hora duplicada, pero configurarlo siempre evita tener que recordar en qué caso hace falta.
+
 ### Mecánica
 
-En cada ejecución de CRON, si ya pasó `FECHA_CAMBIO_HORARIO` y esa fecha exacta todavía no fue marcada como procesada:
+En cada ejecución de CRON, si ya pasó `FECHA_CAMBIO_HORARIO` (interpretada según se explica arriba) y esa fecha exacta todavía no fue marcada como procesada:
 
 1. **Sistema operativo**: compara `date +%:z` contra `OFFSET_CAMBIO_HORARIO_ESPERADO`.
 2. **PHP vía Apache**: hace `curl` a `CAMBIO_HORARIO_PHP_URL`, que debe devolver texto plano con el formato `AAAA-mm-dd HH:MM:SS|+HH:MM` (ver más abajo el contenido de `hora.php`), y compara el segundo campo.
@@ -873,6 +884,7 @@ Basta con actualizar en `monitor-servidor.conf`:
 
 ```bash
 FECHA_CAMBIO_HORARIO="<fecha y hora local del próximo cambio>"
+OFFSET_ANTES_CAMBIO_HORARIO="<offset vigente justo antes, ej. -03:00 antes del retraso a horario de invierno>"
 OFFSET_CAMBIO_HORARIO_ESPERADO="<nuevo offset esperado, ej. -04:00 para el cambio a horario de invierno>"
 ```
 
@@ -1035,6 +1047,14 @@ curl -v "https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 ```
 
 Revise conectividad de salida hacia Healthchecks.io, `HEALTHCHECKS_URL` en `monitor-servidor.conf` y `HEALTHCHECKS_HABILITADO=1`. Un fallo aislado no es crítico: el propio Healthchecks.io notificará si los pings dejan de llegar dentro del período configurado ahí.
+
+### Evento `cambio_horario` con `fecha_invalida=...`
+
+`FECHA_CAMBIO_HORARIO` cae en una hora local que no existe (típico en un adelanto de reloj, ej. `00:00:00` cuando el reloj salta directo a la `01:00:00`) y `date -d` no puede resolverla sin ayuda. Configure `OFFSET_ANTES_CAMBIO_HORARIO` con el offset vigente justo antes del cambio (ver [sección 15A](#15a-verificación-puntual-de-cambio-de-horario-dst)). Puede validar la corrección con:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --probar-cambio-horario
+```
 
 ---
 

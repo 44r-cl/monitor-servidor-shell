@@ -268,9 +268,16 @@ TIEMPO_SOSTENIDO_RDS=300
 # PHP (vía Apache) y MySQL reflejen el nuevo offset UTC. Se auto-desactiva
 # marcando esa fecha como procesada en el estado persistente: para el
 # próximo cambio de horario (Chile tiene dos al año, por decreto), basta con
-# actualizar FECHA_CAMBIO_HORARIO y OFFSET_CAMBIO_HORARIO_ESPERADO.
+# actualizar FECHA_CAMBIO_HORARIO, OFFSET_ANTES_CAMBIO_HORARIO y
+# OFFSET_CAMBIO_HORARIO_ESPERADO.
 CHECK_CAMBIO_HORARIO_HABILITADO=1
 FECHA_CAMBIO_HORARIO="2026-09-06 00:00:00"
+
+# Offset vigente justo ANTES del cambio. Obligatorio en un adelanto de reloj:
+# el instante configurado arriba ("00:00:00") es una hora local que nunca
+# llega a existir -salta directo a la 01:00:00-, así que sin este dato
+# "date -d" la rechaza como fecha inválida.
+OFFSET_ANTES_CAMBIO_HORARIO="-04:00"
 OFFSET_CAMBIO_HORARIO_ESPERADO="-03:00"
 CAMBIO_HORARIO_PHP_URL="https://www.defacto.cl/monitor-servidor/hora.php"
 
