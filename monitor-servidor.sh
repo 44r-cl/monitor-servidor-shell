@@ -193,6 +193,7 @@ MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS="${MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHA
 MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS="${MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS:-3600}"
 UMBRAL_RDS_CPU_PCT="${UMBRAL_RDS_CPU_PCT:-80}"
 UMBRAL_RDS_MEMORIA_LIBRE_MB="${UMBRAL_RDS_MEMORIA_LIBRE_MB:-1024}"
+UMBRAL_RDS_STORAGE_LIBRE_MB="${UMBRAL_RDS_STORAGE_LIBRE_MB:-2048}"
 UMBRAL_RDS_SWAP_MB="${UMBRAL_RDS_SWAP_MB:-512}"
 UMBRAL_RDS_CPU_CREDIT_BALANCE="${UMBRAL_RDS_CPU_CREDIT_BALANCE:-50}"
 UMBRAL_RDS_BURST_BALANCE_PCT="${UMBRAL_RDS_BURST_BALANCE_PCT:-20}"
@@ -293,7 +294,7 @@ categoria_de_variable() {
             printf 'Certificados TLS' ;;
         MYSQL_CNF|MYSQL_TIMEOUT|MYSQL_INTENTOS|UMBRAL_MYSQL_CONEXIONES_PCT|UMBRAL_MYSQL_THREADS_RUNNING|TIEMPO_SOSTENIDO_MYSQL|UMBRAL_MYSQL_SLOW_POR_MINUTO|CHECK_MYSQL_SLOW_QUERY_DETAILS|MYSQL_SLOW_QUERY_LOG_GROUP|UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES|VENTANA_MYSQL_SLOW_QUERY_REPETICIONES|SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY|MYSQL_SLOW_QUERY_USUARIOS_BACKUP|UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS|MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS)
             printf 'MySQL / RDS' ;;
-        AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS)
+        AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_STORAGE_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS)
             printf 'AWS CLI / CloudWatch' ;;
         CHECK_CAMBIO_HORARIO_HABILITADO|FECHA_CAMBIO_HORARIO|OFFSET_ANTES_CAMBIO_HORARIO|OFFSET_CAMBIO_HORARIO_ESPERADO|CAMBIO_HORARIO_PHP_URL|VENTANA_CAMBIO_HORARIO_SEGUNDOS)
             printf 'Cambio de horario (DST)' ;;
@@ -2197,9 +2198,10 @@ obtener_metrica_rds() {
 monitorear_aws() {
     local estado_rds="" estado_ec2=""
     local rds_cpu="" rds_memoria_bytes="" rds_memoria_mb="" rds_conexiones=""
+    local rds_storage_bytes="" rds_storage_mb=""
     local rds_swap_bytes="" rds_swap_mb="" rds_cpu_credit_balance="" rds_burst_balance=""
-    local rds_cpu_log rds_memoria_mb_log rds_swap_mb_log rds_cpu_credit_balance_log rds_burst_balance_log rds_conexiones_log
-    local condicion_estado_rds=0 condicion_rds_cpu=0 condicion_rds_memoria=0 condicion_rds_conexiones=0
+    local rds_cpu_log rds_memoria_mb_log rds_storage_mb_log rds_swap_mb_log rds_cpu_credit_balance_log rds_burst_balance_log rds_conexiones_log
+    local condicion_estado_rds=0 condicion_rds_cpu=0 condicion_rds_memoria=0 condicion_rds_storage=0 condicion_rds_conexiones=0
     local condicion_rds_swap=0 condicion_rds_creditos_cpu=0 condicion_rds_burst=0
     local condicion_estado_ec2=0
 
@@ -2242,6 +2244,7 @@ monitorear_aws() {
 
         rds_cpu="$(obtener_metrica_rds CPUUtilization Average 60 10 || true)"
         rds_memoria_bytes="$(obtener_metrica_rds FreeableMemory Average 60 10 || true)"
+        rds_storage_bytes="$(obtener_metrica_rds FreeStorageSpace Average 60 10 || true)"
         rds_swap_bytes="$(obtener_metrica_rds SwapUsage Average 60 10 || true)"
         # Las métricas de créditos CPU de RDS se publican cada 5 minutos.
         rds_cpu_credit_balance="$(obtener_metrica_rds CPUCreditBalance Average 300 30 || true)"
@@ -2252,18 +2255,23 @@ monitorear_aws() {
             rds_memoria_mb="$(awk -v bytes="$rds_memoria_bytes" 'BEGIN {printf "%.2f", bytes/1024/1024}')"
         fi
 
+        if es_numero "$rds_storage_bytes"; then
+            rds_storage_mb="$(awk -v bytes="$rds_storage_bytes" 'BEGIN {printf "%.2f", bytes/1024/1024}')"
+        fi
+
         if es_numero "$rds_swap_bytes"; then
             rds_swap_mb="$(awk -v bytes="$rds_swap_bytes" 'BEGIN {printf "%.2f", bytes/1024/1024}')"
         fi
 
         rds_cpu_log="$(formatear_decimal_log "${rds_cpu:-NA}")"
         rds_memoria_mb_log="$(formatear_decimal_log "${rds_memoria_mb:-NA}")"
+        rds_storage_mb_log="$(formatear_decimal_log "${rds_storage_mb:-NA}")"
         rds_swap_mb_log="$(formatear_decimal_log "${rds_swap_mb:-NA}")"
         rds_cpu_credit_balance_log="$(formatear_decimal_log "${rds_cpu_credit_balance:-NA}")"
         rds_burst_balance_log="$(formatear_decimal_log "${rds_burst_balance:-NA}")"
         rds_conexiones_log="$(formatear_decimal_log "${rds_conexiones:-NA}")"
 
-        registrar "INFO" "rds_cloudwatch" "db_instance=${RDS_DB_INSTANCE_ID} estado=${estado_rds:-desconocido} cpu_pct=${rds_cpu_log} memoria_libre_mb=${rds_memoria_mb_log} swap_mb=${rds_swap_mb_log} cpu_credit_balance=${rds_cpu_credit_balance_log} burst_balance_pct=${rds_burst_balance_log} conexiones=${rds_conexiones_log}"
+        registrar "INFO" "rds_cloudwatch" "db_instance=${RDS_DB_INSTANCE_ID} estado=${estado_rds:-desconocido} cpu_pct=${rds_cpu_log} memoria_libre_mb=${rds_memoria_mb_log} storage_libre_mb=${rds_storage_mb_log} swap_mb=${rds_swap_mb_log} cpu_credit_balance=${rds_cpu_credit_balance_log} burst_balance_pct=${rds_burst_balance_log} conexiones=${rds_conexiones_log}"
 
         if es_numero "$rds_cpu"; then
             if mayor_igual "$rds_cpu" "$UMBRAL_RDS_CPU_PCT"; then
@@ -2297,6 +2305,23 @@ monitorear_aws() {
                 "Memoria libre de RDS ${RDS_DB_INSTANCE_ID} volvió a nivel normal: ${rds_memoria_mb} MB."
         else
             registrar "WARN" "rds_cloudwatch" "Sin dato válido para FreeableMemory de ${RDS_DB_INSTANCE_ID}."
+        fi
+
+        if es_numero "$rds_storage_mb"; then
+            if menor_igual "$rds_storage_mb" "$UMBRAL_RDS_STORAGE_LIBRE_MB"; then
+                condicion_rds_storage=1
+            fi
+
+            gestionar_alerta \
+                "rds_storage" \
+                "$condicion_rds_storage" \
+                "$TIEMPO_SOSTENIDO_RDS" \
+                "Espacio en disco RDS bajo - ${NOMBRE_SERVIDOR}" \
+                "RDS ${RDS_DB_INSTANCE_ID}: FreeStorageSpace=${rds_storage_mb} MB <= ${UMBRAL_RDS_STORAGE_LIBRE_MB} MB. Sin espacio, RDS puede pasar a solo lectura o caerse." \
+                1 \
+                "Espacio en disco de RDS ${RDS_DB_INSTANCE_ID} volvió a nivel normal: ${rds_storage_mb} MB."
+        else
+            registrar "WARN" "rds_cloudwatch" "Sin dato válido para FreeStorageSpace de ${RDS_DB_INSTANCE_ID}."
         fi
 
         # SwapUsage: alerta cuando el consumo de swap supera el umbral y

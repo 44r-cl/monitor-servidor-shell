@@ -290,6 +290,11 @@ UMBRAL_RDS_CPU_PCT=80
 # por debajo de 512 MB sostenidos y ajustaremos con el histórico real.
 UMBRAL_RDS_MEMORIA_LIBRE_MB=512
 
+# FreeStorageSpace en MB. Sin espacio, RDS puede pasar a solo lectura o
+# caerse. Comenzamos alertando por debajo de 2 GB y ajustaremos con el
+# histórico real según el storage total asignado a esta instancia.
+UMBRAL_RDS_STORAGE_LIBRE_MB=2048
+
 # SwapUsage en MB. 0 deshabilita esta alerta.
 # Un poco de swap no implica por sí solo presión crítica; se correlaciona con
 # FreeableMemory y se exige que la condición sea sostenida.

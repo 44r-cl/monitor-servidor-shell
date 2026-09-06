@@ -788,6 +788,7 @@ Se consultan métricas como:
 ```text
 CPUUtilization
 FreeableMemory
+FreeStorageSpace
 SwapUsage
 CPUCreditBalance
 BurstBalance
@@ -797,6 +798,8 @@ DatabaseConnections
 Los thresholds se definen en `monitor-servidor.conf`.
 
 `SwapUsage` se correlaciona con `FreeableMemory`; un valor de swap por sí solo no significa necesariamente presión activa de memoria.
+
+`FreeStorageSpace` (`UMBRAL_RDS_STORAGE_LIBRE_MB`) alerta cuando el espacio en disco libre de la instancia cae por debajo del umbral. Sin espacio, RDS puede pasar a modo de solo lectura o caerse — a diferencia de espacio en disco del EC2 (sección 8A), este no se resuelve liberando archivos locales, requiere aumentar el storage asignado a la instancia (o habilitar/ajustar el auto-scaling de storage de RDS).
 
 `CPUCreditBalance` aplica a familias RDS burstable como T2/T3/T4g.
 
