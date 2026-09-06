@@ -9,6 +9,9 @@
 USER_KEY="xxxxx"
 API_TOKEN="xxxxx"
 PUSHOVER_HABILITADO=1
+PUSHOVER_URL="https://api.pushover.net/1/messages.json"
+INTENTOS_PUSHOVER="3"
+SEGUNDOS_ENTRE_REINTENTOS="2"
 
 # Repite una alerta todavía activa como máximo cada 30 minutos.
 SEGUNDOS_COOLDOWN_ALERTA=1800
@@ -132,6 +135,10 @@ TIEMPO_SOSTENIDO_APACHE=120
 # Conexiones TCP ESTABLISHED hacia puertos 80/443.
 UMBRAL_APACHE_CONEXIONES=250
 TIEMPO_SOSTENIDO_CONEXIONES_APACHE=120
+
+# Logs Apache default
+APACHE_ERROR_LOG="/var/log/apache2/error.log"
+APACHE_ACCESS_LOG="/var/log/apache2/access.log"
 
 # Logs Apache por sitio. Formato: nombre|error.log|access.log
 # Se pueden agregar tantos VirtualHosts como sea necesario.
