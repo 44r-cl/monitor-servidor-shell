@@ -228,7 +228,9 @@ Como todavía no ocurrió el cambio, es normal que el offset actual no coincida 
 sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
 ```
 
-Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, e imprime cada una que **no** está seteada ahí — es decir, que está corriendo silenciosamente con el valor por defecto embebido en el script, en vez de una decisión explícita del administrador.
+Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, y muestra dos listas: las **configuradas explícitamente** (con su valor real) y las que están corriendo silenciosamente con el **valor por defecto** embebido en el script, sin una decisión explícita del administrador.
+
+`USER_KEY`, `API_TOKEN` y `HEALTHCHECKS_URL` se muestran enmascarados (solo los primeros caracteres, ej. `abcd...`) porque son secretos: lo suficiente para confirmar visualmente que el valor cargado es el esperado, sin exponerlo completo si la salida se comparte por accidente (un ticket, un chat, una captura de pantalla).
 
 Use este comando después de actualizar `monitor-servidor.sh` (por ejemplo tras un `git pull`) para detectar de inmediato si una funcionalidad nueva quedó a medio configurar, en vez de descubrirlo por un aviso de Pushover que nunca llegó o un `WARN` en el log días después. Termina con código de salida `1` si encuentra alguna variable sin setear, útil para incorporarlo a un chequeo posterior a un despliegue.
 

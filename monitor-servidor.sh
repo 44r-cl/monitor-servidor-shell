@@ -248,6 +248,24 @@ escapar_json() {
         | tr '\r\n\t' '   '
 }
 
+# Enmascara parcialmente un secreto para mostrarlo en diagnósticos: conserva
+# solo los primeros caracteres, lo suficiente para reconocer visualmente que
+# es el valor esperado sin exponerlo completo. Cadena vacía si no hay valor.
+enmascarar_secreto() {
+    local valor="$1"
+    local largo=${#valor}
+
+    if (( largo == 0 )); then
+        return 0
+    fi
+
+    if (( largo <= 4 )); then
+        printf '%s...' "${valor:0:2}"
+    else
+        printf '%s...' "${valor:0:4}"
+    fi
+}
+
 registrar() {
     local nivel="$1"
     local evento="$2"
@@ -2669,7 +2687,9 @@ main() {
         --diagnostico-config)
             local archivo_script_propio="$0"
             local -a excluidas=(ARCHIVO_CONFIG)
-            local var valor_actual faltantes=0 excluida
+            local -a secretas=(USER_KEY API_TOKEN HEALTHCHECKS_URL)
+            local -a lineas_configuradas=() lineas_faltantes=()
+            local var valor_actual faltantes=0 excluida secreta es_secreta
 
             if [[ ! -r "$archivo_script_propio" ]]; then
                 printf 'No se pudo leer el propio script (%s) para enumerar sus variables conocidas.\n' "$archivo_script_propio" >&2
@@ -2689,16 +2709,36 @@ main() {
                     [[ "$var" == "$excluida" ]] && continue 2
                 done
 
-                if [[ -r "$ARCHIVO_CONFIG" ]] && grep -Eq "^[[:space:]]*${var}=" "$ARCHIVO_CONFIG"; then
-                    continue
+                valor_actual="${!var}"
+                es_secreta=0
+                for secreta in "${secretas[@]}"; do
+                    [[ "$var" == "$secreta" ]] && es_secreta=1 && break
+                done
+
+                if (( es_secreta == 1 )) && [[ -n "$valor_actual" ]]; then
+                    valor_actual="$(enmascarar_secreto "$valor_actual")"
                 fi
 
-                faltantes=$((faltantes + 1))
-                valor_actual="${!var}"
-                printf '  %-45s (valor por defecto: %s)\n' "$var" "${valor_actual:-<vacío>}"
+                if [[ -r "$ARCHIVO_CONFIG" ]] && grep -Eq "^[[:space:]]*${var}=" "$ARCHIVO_CONFIG"; then
+                    lineas_configuradas+=("$(printf '  %-45s = %s' "$var" "${valor_actual:-<vacío>}")")
+                else
+                    faltantes=$((faltantes + 1))
+                    lineas_faltantes+=("$(printf '  %-45s (valor por defecto: %s)' "$var" "${valor_actual:-<vacío>}")")
+                fi
             done < <(grep -oE '^[A-Z][A-Z0-9_]*="\$\{[A-Z][A-Z0-9_]*:-' "$archivo_script_propio" \
                 | sed -E 's/^([A-Z][A-Z0-9_]*)=.*/\1/' \
                 | sort -u)
+
+            printf 'Configuradas explícitamente (%d):\n' "${#lineas_configuradas[@]}"
+            if (( ${#lineas_configuradas[@]} > 0 )); then
+                printf '%s\n' "${lineas_configuradas[@]}"
+            fi
+            printf '\nSecretos (%s) enmascarados: se muestran solo los primeros caracteres.\n\n' "${secretas[*]}"
+
+            printf 'Usando valor por defecto (%d):\n' "$faltantes"
+            if (( faltantes > 0 )); then
+                printf '%s\n' "${lineas_faltantes[@]}"
+            fi
 
             printf '\n'
             if (( faltantes == 0 )); then
