@@ -6,8 +6,8 @@
 # Pushover
 ###############################################################################
 
-USER_KEY="xxxxx"
-API_TOKEN="xxxxx"
+USER_KEY="key"
+API_TOKEN="api_token"
 PUSHOVER_HABILITADO=1
 PUSHOVER_URL="https://api.pushover.net/1/messages.json"
 INTENTOS_PUSHOVER="3"
@@ -29,7 +29,7 @@ ALERTAR_RECUPERACION=1
 # En el ntfy.sh público cualquiera que adivine el tópico puede leer sus
 # notificaciones o publicar mensajes falsos ahí: use un nombre largo y
 # aleatorio, no algo predecible como "monitor-df-ec2".
-NTFY_HABILITADO=0
+NTFY_HABILITADO=1
 NTFY_URL="https://ntfy.sh/CAMBIAR-por-un-topico-largo-y-aleatorio"
 
 # Token opcional, solo necesario para instancias self-hosted con auth.
@@ -49,7 +49,7 @@ NTFY_TIMEOUT=15
 # Cree un check en https://healthchecks.io (u otra instancia propia) con un
 # período igual a la cadencia de CRON (1 minuto) y un margen de gracia
 # razonable, y configure ahí su propia notificación (Pushover, email, etc.).
-HEALTHCHECKS_HABILITADO=0
+HEALTHCHECKS_HABILITADO=1
 HEALTHCHECKS_URL="https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 HEALTHCHECKS_TIMEOUT=10
 
@@ -102,7 +102,7 @@ RUTAS_DISCO_MONITOREADAS=(
 )
 
 # Alertar por uso de espacio o inodos sostenido durante 2 minutos.
-UMBRAL_DISCO_USO_PCT=85
+UMBRAL_DISCO_USO_PCT=80
 UMBRAL_DISCO_INODOS_PCT=90
 TIEMPO_SOSTENIDO_DISCO=120
 
@@ -357,3 +357,19 @@ CAMBIO_HORARIO_PHP_URL="https://www.defacto.cl/monitor-servidor/hora.php"
 # Si algún chequeo falla (Apache/MySQL momentáneamente no disponibles),
 # reintenta cada minuto hasta agotar esta ventana desde FECHA_CAMBIO_HORARIO.
 VENTANA_CAMBIO_HORARIO_SEGUNDOS=3600
+
+###############################################################################
+# Respaldos programados
+###############################################################################
+
+CHECK_RESPALDO_HABILITADO=1
+ESTADO_RESPALDO_FILE="/home/aalcafuz/zrespaldos/logs/ultimo_backup.estado"
+
+# Un backup OK más antiguo que 26 horas se considera atrasado/no ejecutado.
+MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS=93600
+
+# Un backup EN_PROGRESO por más de 2 horas se considera posiblemente bloqueado.
+MAX_DURACION_RESPALDO_SEGUNDOS=7200
+
+# Repetición máxima para el mismo problema persistente de respaldo.
+SEGUNDOS_COOLDOWN_RESPALDO=86400

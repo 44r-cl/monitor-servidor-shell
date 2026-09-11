@@ -114,6 +114,15 @@ if ! declare -p RUTAS_CRECIMIENTO_DIRECTORIOS >/dev/null 2>&1; then
     )
 fi
 
+# Respaldo programado de programas y bases de datos. El script de backup deja
+# un archivo de estado atómico con EN_PROGRESO, OK o ERROR; este monitor solo
+# alerta ante estados anómalos y registra también los estados normales.
+CHECK_RESPALDO_HABILITADO="${CHECK_RESPALDO_HABILITADO:-1}"
+ESTADO_RESPALDO_FILE="${ESTADO_RESPALDO_FILE:-/home/aalcafuz/zrespaldos/logs/ultimo_backup.estado}"
+MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS="${MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS:-93600}"
+MAX_DURACION_RESPALDO_SEGUNDOS="${MAX_DURACION_RESPALDO_SEGUNDOS:-7200}"
+SEGUNDOS_COOLDOWN_RESPALDO="${SEGUNDOS_COOLDOWN_RESPALDO:-86400}"
+
 # Apache.
 APACHE_SERVICIO="${APACHE_SERVICIO:-apache2}"
 APACHE_PROCESO="${APACHE_PROCESO:-apache2}"
@@ -297,6 +306,8 @@ categoria_de_variable() {
             printf 'Linux / EC2' ;;
         CHECK_ESPACIO_DISCO|UMBRAL_DISCO_USO_PCT|UMBRAL_DISCO_INODOS_PCT|TIEMPO_SOSTENIDO_DISCO|CHECK_CRECIMIENTO_DIRECTORIOS|DIRECTORIO_SNAPSHOTS_DIRECTORIOS|INTERVALO_SNAPSHOT_DIRECTORIOS|VENTANA_CRECIMIENTO_DIRECTORIOS|TOLERANCIA_SNAPSHOT_DIRECTORIOS|RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS|TIMEOUT_DU_DIRECTORIO|SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO)
             printf 'Disco y crecimiento de directorios' ;;
+        CHECK_RESPALDO_HABILITADO|ESTADO_RESPALDO_FILE|MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS|MAX_DURACION_RESPALDO_SEGUNDOS|SEGUNDOS_COOLDOWN_RESPALDO)
+            printf 'Respaldos programados' ;;
         APACHE_SERVICIO|APACHE_PROCESO|APACHE_STATUS_URL|APACHE_HOST_HEADER|APACHE_MAX_REQUEST_WORKERS|UMBRAL_APACHE_SATURACION_PCT|TIEMPO_SOSTENIDO_APACHE|UMBRAL_APACHE_CONEXIONES|TIEMPO_SOSTENIDO_CONEXIONES_APACHE|APACHE_ERROR_LOG|APACHE_ACCESS_LOG|CHECK_CONFIG_ERRORS|REGEX_APACHE_CONFIG_ERROR|UMBRAL_APACHE_CONFIG_ERROR|CHECK_PHP_ERRORS|REGEX_APACHE_PHP_ERROR|UMBRAL_APACHE_PHP_ERROR|CHECK_RESOURCE_ERRORS|REGEX_APACHE_RESOURCE_ERROR|UMBRAL_APACHE_RESOURCE_ERROR|CHECK_HTTP_ERRORS|REGEX_APACHE_HTTP_ERROR|UMBRAL_APACHE_HTTP_ERROR|CHECK_SECURITY_ERRORS|REGEX_APACHE_SECURITY_ERROR|UMBRAL_APACHE_SECURITY_ERROR)
             printf 'Apache' ;;
         CHECK_SSH_AUTH_HABILITADO|SSH_AUTH_LOG|UMBRAL_SSH_FALLOS_IP|VENTANA_SSH_FALLOS_IP_SEGUNDOS|SEGUNDOS_COOLDOWN_SSH_FALLOS_IP)
@@ -999,6 +1010,235 @@ monitorear_crecimiento_directorios() {
 
     printf '%s\n' "$ahora" > "$archivo_ultimo"
     find "$DIRECTORIO_SNAPSHOTS_DIRECTORIOS" -type f -name '*.snapshot' -mtime "+${RETENCION_SNAPSHOTS_DIRECTORIOS_DIAS}" -delete 2>/dev/null || true
+}
+
+###############################################################################
+# Respaldos programados
+###############################################################################
+
+# Mantiene un cooldown propio para anomalías del respaldo. Una firma distinta
+# representa un nuevo intento o un problema diferente y puede alertar de
+# inmediato; la recuperación solo se considera completa cuando hay un OK.
+#
+# Argumentos:
+#   1: 1 si existe una anomalía; 0 en caso contrario.
+#   2: firma estable del problema actual.
+#   3: título de la alerta.
+#   4: mensaje de la alerta.
+#   5: 1 si el estado actual permite cerrar una alerta previa; 0 si no.
+#   6: mensaje de recuperación.
+gestionar_alerta_respaldo() {
+    local condicion="$1"
+    local firma="$2"
+    local titulo="$3"
+    local mensaje="$4"
+    local permite_recuperacion="$5"
+    local mensaje_recuperacion="$6"
+    local archivo_estado="${DIRECTORIO_ESTADO}/respaldo_alerta.estado"
+    local firma_anterior="" ultima_alerta=0 alertado=0 ahora
+
+    ahora="$(date +%s)"
+
+    if [[ -r "$archivo_estado" ]]; then
+        IFS='|' read -r firma_anterior ultima_alerta alertado < "$archivo_estado" || true
+        ultima_alerta="${ultima_alerta:-0}"
+        alertado="${alertado:-0}"
+    fi
+
+    [[ "$ultima_alerta" =~ ^[0-9]+$ ]] || ultima_alerta=0
+    [[ "$alertado" =~ ^[01]$ ]] || alertado=0
+
+    if [[ "$condicion" == "1" ]]; then
+        if [[ "$firma" != "$firma_anterior" ]]; then
+            ultima_alerta=0
+            alertado=0
+        fi
+
+        if (( alertado == 0 || ahora - ultima_alerta >= SEGUNDOS_COOLDOWN_RESPALDO )); then
+            if enviar_notificacion "$titulo" "$mensaje" 1; then
+                ultima_alerta="$ahora"
+                alertado=1
+            fi
+        fi
+
+        printf '%s|%s|%s\n' "$firma" "$ultima_alerta" "$alertado" > "$archivo_estado"
+        return 0
+    fi
+
+    # EN_PROGRESO dentro del tiempo permitido no prueba todavía que el backup
+    # anterior se haya recuperado; se espera un OK antes de cerrar la alerta.
+    if [[ "$permite_recuperacion" != "1" ]]; then
+        return 0
+    fi
+
+    if (( alertado == 1 )) && [[ "$ALERTAR_RECUPERACION" == "1" ]]; then
+        enviar_notificacion "RECUPERADO - ${NOMBRE_SERVIDOR}" "$mensaje_recuperacion" 0 || true
+    fi
+
+    rm -f "$archivo_estado"
+}
+
+# Lee el archivo de estado generado por z_crea_respaldo.sh en modo backup.
+# No ejecuta ni hace source del archivo: solo acepta las claves conocidas.
+# Registra cada observación como evento "respaldo" y alerta si el último
+# respaldo falló, está atrasado, permanece demasiado tiempo EN_PROGRESO o el
+# estado no puede interpretarse de forma segura.
+monitorear_respaldo() {
+    local ahora estado="" modo="" host_backup="" inicio_epoch="" inicio_iso=""
+    local fin_epoch="" fin_iso="" duracion_s="" exit_code="" s3_bd="" s3_pgms=""
+    local actualizacion_epoch="" actualizacion_iso="" clave valor antiguedad_s=0
+    local transcurrido_s=0 firma="" mtime=0
+    local archivo_ausente_desde="${DIRECTORIO_ESTADO}/respaldo_estado_ausente.desde"
+    local ausente_desde=0 ausencia_s=0
+
+    if ! booleano_habilitado "$CHECK_RESPALDO_HABILITADO"; then
+        return 0
+    fi
+
+    ahora="$(date +%s)"
+
+    if [[ ! -e "$ESTADO_RESPALDO_FILE" ]]; then
+        if [[ -r "$archivo_ausente_desde" ]]; then
+            read -r ausente_desde < "$archivo_ausente_desde" || true
+        fi
+        [[ "$ausente_desde" =~ ^[0-9]+$ ]] || ausente_desde=0
+        if (( ausente_desde == 0 )); then
+            ausente_desde="$ahora"
+            printf '%s\n' "$ausente_desde" > "$archivo_ausente_desde"
+        fi
+
+        ausencia_s=$((ahora - ausente_desde))
+        if (( ausencia_s >= MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS )); then
+            registrar "WARN" "respaldo" "estado=SIN_ESTADO ruta=${ESTADO_RESPALDO_FILE} ausencia_s=${ausencia_s} limite_s=${MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS}"
+            firma="SIN_ESTADO:${ausente_desde}"
+            gestionar_alerta_respaldo \
+                1 "$firma" \
+                "Respaldo no detectado - ${NOMBRE_SERVIDOR}" \
+                "No existe ${ESTADO_RESPALDO_FILE} desde hace ${ausencia_s}s. Límite=${MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS}s. Revise el CRON y z_crea_respaldo.sh." \
+                0 \
+                "El respaldo programado volvió a registrar un estado OK en ${NOMBRE_SERVIDOR}."
+        else
+            registrar "INFO" "respaldo" "estado=SIN_ESTADO ruta=${ESTADO_RESPALDO_FILE} ausencia_s=${ausencia_s} gracia_s=${MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS} pushover=omitido"
+            gestionar_alerta_respaldo 0 "" "" "" 0 ""
+        fi
+        return 0
+    fi
+
+    rm -f "$archivo_ausente_desde"
+
+    if [[ ! -r "$ESTADO_RESPALDO_FILE" ]]; then
+        mtime="$(stat -c '%Y' "$ESTADO_RESPALDO_FILE" 2>/dev/null || printf '0')"
+        registrar "ERROR" "respaldo" "estado=NO_LEGIBLE ruta=${ESTADO_RESPALDO_FILE}"
+        gestionar_alerta_respaldo \
+            1 "NO_LEGIBLE:${mtime}" \
+            "Estado de respaldo no legible - ${NOMBRE_SERVIDOR}" \
+            "El archivo ${ESTADO_RESPALDO_FILE} existe pero no puede leerse. Revise propietario y permisos." \
+            0 \
+            "El estado del respaldo volvió a ser legible y el último backup está OK en ${NOMBRE_SERVIDOR}."
+        return 0
+    fi
+
+    while IFS='=' read -r clave valor; do
+        case "$clave" in
+            estado) estado="$valor" ;;
+            modo) modo="$valor" ;;
+            host) host_backup="$valor" ;;
+            inicio_epoch) inicio_epoch="$valor" ;;
+            inicio_iso) inicio_iso="$valor" ;;
+            fin_epoch) fin_epoch="$valor" ;;
+            fin_iso) fin_iso="$valor" ;;
+            duracion_s) duracion_s="$valor" ;;
+            exit_code) exit_code="$valor" ;;
+            s3_bd) s3_bd="$valor" ;;
+            s3_pgms) s3_pgms="$valor" ;;
+            actualizacion_epoch) actualizacion_epoch="$valor" ;;
+            actualizacion_iso) actualizacion_iso="$valor" ;;
+        esac
+    done < "$ESTADO_RESPALDO_FILE"
+
+    mtime="$(stat -c '%Y' "$ESTADO_RESPALDO_FILE" 2>/dev/null || printf '0')"
+
+    if [[ "$modo" != "backup" || ! "$inicio_epoch" =~ ^[0-9]+$ || "$inicio_epoch" == "0" ]]; then
+        registrar "ERROR" "respaldo" "estado=INVALIDO ruta=${ESTADO_RESPALDO_FILE} modo=${modo:-desconocido} inicio_epoch=${inicio_epoch:-invalido}"
+        gestionar_alerta_respaldo \
+            1 "INVALIDO:${mtime}" \
+            "Estado de respaldo inválido - ${NOMBRE_SERVIDOR}" \
+            "El archivo ${ESTADO_RESPALDO_FILE} no contiene un estado de backup válido. modo=${modo:-desconocido}; inicio_epoch=${inicio_epoch:-invalido}." \
+            0 \
+            "El archivo de estado del respaldo volvió a ser válido y el último backup está OK en ${NOMBRE_SERVIDOR}."
+        return 0
+    fi
+
+    case "$estado" in
+        OK)
+            if [[ ! "$fin_epoch" =~ ^[0-9]+$ || "$fin_epoch" == "0" || ! "$duracion_s" =~ ^[0-9]+$ || "$exit_code" != "0" || -z "$s3_bd" || -z "$s3_pgms" ]]; then
+                registrar "ERROR" "respaldo" "estado=INVALIDO estado_archivo=OK fin_epoch=${fin_epoch:-invalido} duracion_s=${duracion_s:-invalido} exit_code=${exit_code:-invalido} s3_bd=${s3_bd:-vacio} s3_pgms=${s3_pgms:-vacio}"
+                gestionar_alerta_respaldo \
+                    1 "INVALIDO_OK:${mtime}" \
+                    "Estado de respaldo inválido - ${NOMBRE_SERVIDOR}" \
+                    "El estado figura OK pero faltan datos obligatorios o exit_code no es 0 en ${ESTADO_RESPALDO_FILE}." \
+                    0 \
+                    "El estado del respaldo volvió a ser válido y el último backup está OK en ${NOMBRE_SERVIDOR}."
+                return 0
+            fi
+
+            if (( ahora >= fin_epoch )); then
+                antiguedad_s=$((ahora - fin_epoch))
+            fi
+
+            if (( antiguedad_s > MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS )); then
+                registrar "WARN" "respaldo" "estado=OK resultado=ATRASADO antiguedad_s=${antiguedad_s} limite_s=${MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS} duracion_s=${duracion_s} fin=${fin_iso:-desconocido} s3_bd=${s3_bd} s3_pgms=${s3_pgms}"
+                gestionar_alerta_respaldo \
+                    1 "ATRASADO:${fin_epoch}" \
+                    "Respaldo atrasado - ${NOMBRE_SERVIDOR}" \
+                    "El último respaldo OK terminó hace ${antiguedad_s}s, superando el límite de ${MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS}s. Fin=${fin_iso:-desconocido}." \
+                    0 \
+                    "El respaldo programado volvió a estar al día en ${NOMBRE_SERVIDOR}."
+            else
+                registrar "INFO" "respaldo" "estado=OK antiguedad_s=${antiguedad_s} duracion_s=${duracion_s} exit_code=0 inicio=${inicio_iso:-desconocido} fin=${fin_iso:-desconocido} s3_bd=${s3_bd} s3_pgms=${s3_pgms}"
+                gestionar_alerta_respaldo \
+                    0 "" "" "" 1 \
+                    "Respaldo OK en ${NOMBRE_SERVIDOR}. Último fin=${fin_iso:-desconocido}; duración=${duracion_s}s."
+            fi
+            ;;
+        ERROR)
+            [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code="desconocido"
+            registrar "ERROR" "respaldo" "estado=ERROR exit_code=${exit_code} inicio=${inicio_iso:-desconocido} fin=${fin_iso:-desconocido} duracion_s=${duracion_s:-desconocido} s3_bd=${s3_bd:-vacio} s3_pgms=${s3_pgms:-vacio}"
+            gestionar_alerta_respaldo \
+                1 "ERROR:${inicio_epoch}:${exit_code}:${fin_epoch:-0}" \
+                "Respaldo fallido - ${NOMBRE_SERVIDOR}" \
+                "El respaldo terminó en ERROR. exit_code=${exit_code}; inicio=${inicio_iso:-desconocido}; fin=${fin_iso:-desconocido}; duración=${duracion_s:-desconocido}s. Revise el log del script de respaldo." \
+                0 \
+                "El respaldo programado volvió a terminar correctamente en ${NOMBRE_SERVIDOR}."
+            ;;
+        EN_PROGRESO)
+            if (( ahora >= inicio_epoch )); then
+                transcurrido_s=$((ahora - inicio_epoch))
+            fi
+
+            if (( transcurrido_s > MAX_DURACION_RESPALDO_SEGUNDOS )); then
+                registrar "WARN" "respaldo" "estado=EN_PROGRESO resultado=EXCEDIDO transcurrido_s=${transcurrido_s} limite_s=${MAX_DURACION_RESPALDO_SEGUNDOS} inicio=${inicio_iso:-desconocido}"
+                gestionar_alerta_respaldo \
+                    1 "EN_PROGRESO:${inicio_epoch}" \
+                    "Respaldo posiblemente bloqueado - ${NOMBRE_SERVIDOR}" \
+                    "El respaldo permanece EN_PROGRESO desde ${inicio_iso:-desconocido} (${transcurrido_s}s), superando el límite de ${MAX_DURACION_RESPALDO_SEGUNDOS}s." \
+                    0 \
+                    "El respaldo programado volvió a terminar correctamente en ${NOMBRE_SERVIDOR}."
+            else
+                registrar "INFO" "respaldo" "estado=EN_PROGRESO transcurrido_s=${transcurrido_s} limite_s=${MAX_DURACION_RESPALDO_SEGUNDOS} inicio=${inicio_iso:-desconocido} pushover=omitido"
+                gestionar_alerta_respaldo 0 "" "" "" 0 ""
+            fi
+            ;;
+        *)
+            registrar "ERROR" "respaldo" "estado=INVALIDO valor_estado=${estado:-vacio} ruta=${ESTADO_RESPALDO_FILE}"
+            gestionar_alerta_respaldo \
+                1 "INVALIDO_ESTADO:${mtime}" \
+                "Estado de respaldo inválido - ${NOMBRE_SERVIDOR}" \
+                "El archivo ${ESTADO_RESPALDO_FILE} contiene estado=${estado:-vacio}; se esperaba EN_PROGRESO, OK o ERROR." \
+                0 \
+                "El estado del respaldo volvió a ser válido y el último backup está OK en ${NOMBRE_SERVIDOR}."
+            ;;
+    esac
 }
 
 ###############################################################################
@@ -2687,6 +2927,7 @@ ejecutar_revision() {
     monitorear_sistema
     monitorear_espacio_disco
     monitorear_crecimiento_directorios
+    monitorear_respaldo
     monitorear_apache
     analyze_logs
     monitorear_ssh_auth
@@ -2870,6 +3111,7 @@ main() {
                 "Estado y ejecución"
                 "Linux / EC2"
                 "Disco y crecimiento de directorios"
+                "Respaldos programados"
                 "Apache"
                 "SSH: fuerza bruta"
                 "Certificados TLS"
