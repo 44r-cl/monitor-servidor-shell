@@ -1,6 +1,6 @@
 # Monitor de servidor EC2 / Apache / MySQL-RDS
 
-`monitor-servidor.sh` es un monitor en Bash diseñado para ejecutarse en una instancia Ubuntu sobre AWS EC2. Supervisa el sistema operativo, espacio e inodos de disco, crecimiento de directorios, Apache HTTP Server, logs de múltiples VirtualHosts, MySQL/MariaDB en AWS RDS, métricas de CloudWatch y el estado AWS de EC2/RDS. Las alertas se envían mediante Pushover.
+`monitor-servidor.sh` es un monitor en Bash diseñado para ejecutarse en una instancia Ubuntu sobre AWS EC2. Supervisa el sistema operativo, espacio e inodos de disco, crecimiento de directorios, estado de respaldos programados, Apache HTTP Server, logs de múltiples VirtualHosts, MySQL/MariaDB en AWS RDS, métricas de CloudWatch y el estado AWS de EC2/RDS. Las alertas se envían mediante Pushover.
 
 La instalación recomendada utiliza CRON y ejecuta una revisión cada minuto con `--una-vez`. El monitor usa `flock` para evitar ejecuciones simultáneas.
 
@@ -32,7 +32,7 @@ Se instala en:
 
 ### `monitor-servidor.conf`
 
-Contiene la configuración del monitor: nombre del servidor, thresholds, Pushover, disco y directorios, sitios Apache, MySQL/RDS y AWS.
+Contiene la configuración del monitor: nombre del servidor, thresholds, Pushover, disco y directorios, respaldos programados, sitios Apache, MySQL/RDS y AWS.
 
 Se instala en:
 
@@ -210,60 +210,6 @@ No utilice este modo mientras la tarea CRON esté habilitada.
 sudo /usr/local/sbin/monitor-servidor.sh --probar-alerta
 ```
 
-Requiere `sudo`: `monitor-servidor.conf` tiene permisos `0600 root:root`, y sin privilegios de lectura el comando no puede acceder a `USER_KEY`/`API_TOKEN`. Este modo imprime en pantalla si la notificación se envió o no, junto con la causa del fallo cuando corresponde (config no legible, Pushover deshabilitado, credenciales vacías, etc.). Prueba Pushover en aislamiento real: si `NTFY_HABILITADO=1`, este modo desactiva el respaldo solo para esta prueba puntual, para que un ntfy.sh funcional no enmascare un fallo real de Pushover.
-
-### Probar ntfy.sh (respaldo)
-
-```bash
-sudo /usr/local/sbin/monitor-servidor.sh --probar-ntfy
-```
-
-Envía una notificación de prueba directamente por ntfy.sh (ver [sección 14B](#14b-respaldo-de-notificaciones-con-ntfysh)), sin pasar por Pushover ni depender de que Pushover falle de verdad.
-
-### Probar cambio de horario (dry run)
-
-```bash
-sudo /usr/local/sbin/monitor-servidor.sh --probar-cambio-horario
-```
-
-Ejecuta los mismos 3 chequeos que la verificación real (sistema, PHP vía Apache, MySQL — ver [sección 15A](#15a-verificación-puntual-de-cambio-de-horario-dst)), pero **sin depender de `FECHA_CAMBIO_HORARIO` ni tocar el estado persistente**: es seguro correrlo cualquier día, incluso repetidamente, sin riesgo de marcar el evento real como ya procesado. Sirve para validar *antes* del cambio que las tres fuentes son alcanzables y devuelven un formato parseable.
-
-Como todavía no ocurrió el cambio, es normal que el offset actual no coincida con `OFFSET_CAMBIO_HORARIO_ESPERADO`; el comando lo aclara explícitamente. Lo que sí debe cumplirse hoy es que **las tres fuentes coincidan entre sí** (mismo offset entre sistema, PHP y MySQL) — si no coinciden, hay algo que corregir antes de confiar en la verificación real de esta noche. Si `PUSHOVER_HABILITADO=1`, además envía una notificación de prueba con el título `PRUEBA cambio de horario - ...`, para no confundirla con el resultado real.
-
-### Diagnóstico de configuración
-
-```bash
-sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
-```
-
-Cada variable que el script reconoce está declarada internamente como `VAR="${VAR:-valor_por_defecto}"`. Este modo enumera esas variables comparándolas contra lo que está explícitamente seteado en `monitor-servidor.conf`, y las muestra **agrupadas por área funcional**, en este orden:
-
-1. Pushover
-2. ntfy.sh (respaldo)
-3. Heartbeat externo
-4. Estado y ejecución
-5. Linux / EC2
-6. Disco y crecimiento de directorios
-7. Apache
-8. SSH: fuerza bruta
-9. Certificados TLS
-10. MySQL / RDS
-11. AWS CLI / CloudWatch
-12. Cambio de horario (DST)
-13. Otras (variables futuras que todavía no fueron agregadas a la categorización)
-
-Son las mismas áreas que organiza `monitor-servidor.conf.sample`. Un grupo sin ninguna variable asociada (por ejemplo "Otras", mientras no haga falta) no se muestra. Dentro de cada grupo, cada variable aparece con su valor real (`= valor`) si está configurada explícitamente, o marcada `(valor por defecto: ...)` si está corriendo silenciosamente con el valor embebido en el script, sin una decisión explícita del administrador.
-
-`USER_KEY`, `API_TOKEN`, `HEALTHCHECKS_URL`, `NTFY_URL` y `NTFY_TOKEN` se muestran enmascarados (solo los primeros caracteres, ej. `abcd...`) porque son secretos: lo suficiente para confirmar visualmente que el valor cargado es el esperado, sin exponerlo completo si la salida se comparte por accidente (un ticket, un chat, una captura de pantalla).
-
-Use este comando después de actualizar `monitor-servidor.sh` (por ejemplo tras un `git pull`) para detectar de inmediato si una funcionalidad nueva quedó a medio configurar, en vez de descubrirlo por un aviso de Pushover que nunca llegó o un `WARN` en el log días después. Termina con código de salida `1` si encuentra alguna variable sin setear, útil para incorporarlo a un chequeo posterior a un despliegue.
-
-Limitaciones conocidas:
-
-- Solo cubre variables escalares (`VAR="${VAR:-...}"`); no audita arreglos como `APACHE_SITIOS_LOGS`, `SITIOS_TLS` o `RUTAS_DISCO_MONITOREADAS`.
-- No sabe qué variables son relevantes según qué funcionalidades tiene habilitadas: si `CHECK_TLS_HABILITADO=0`, seguirá listando `UMBRAL_TLS_DIAS_RESTANTES` aunque no importe. Es una ayuda para revisar, no un validador estricto.
-- El agrupamiento por categoría (`categoria_de_variable()` en `monitor-servidor.sh`) es una lista curada a mano; una variable nueva que no se agregue ahí cae en "Otras" sin romper nada, pero conviene mantenerla al día junto con cada funcionalidad nueva.
-
 ### Ayuda
 
 ```bash
@@ -294,6 +240,8 @@ El formato es JSON Lines. Ejemplo conceptual:
 
 Los timestamps locales utilizan ISO 8601 con offset explícito. Las consultas a CloudWatch continúan utilizando UTC.
 
+> **Pendiente operativo:** actualmente no se ha implementado rotación para `/var/log/monitor-servidor/monitor.log`. Debe incorporarse una política de rotación (por ejemplo mediante `logrotate`) para evitar crecimiento indefinido del archivo. Esta tarea queda registrada como mejora pendiente y no forma parte de la funcionalidad de respaldos descrita aquí.
+
 ---
 
 ## 8. Estado persistente
@@ -318,8 +266,8 @@ Ahí se almacenan, entre otros:
 - último momento de snapshot de directorios;
 - snapshots históricos de tamaño de directorios;
 - cooldown independiente por ruta para alertas de crecimiento;
-- fecha ya verificada del cambio de horario (DST), para no repetir la verificación hasta el próximo evento;
-- cursor de lectura de `auth.log` y acumulador de fallos SSH con cooldown por IP;
+- estado de la última anomalía de respaldo y su cooldown;
+- momento desde el cual falta el archivo de estado del respaldo, cuando aplica;
 - lock de ejecución.
 
 No elimine este directorio durante la operación normal. Hacerlo reinicia la memoria persistente del monitor.
@@ -423,6 +371,79 @@ crecimiento_directorio
 
 ---
 
+## 8B. Verificación de respaldos programados
+
+El monitor puede comprobar el resultado del respaldo ejecutado mediante:
+
+```text
+/home/aalcafuz/zrespaldos/z_crea_respaldo.sh backup
+```
+
+La verificación se basa en el archivo de estado atómico generado por ese script:
+
+```text
+/home/aalcafuz/zrespaldos/logs/ultimo_backup.estado
+```
+
+Configuración por defecto:
+
+```bash
+CHECK_RESPALDO_HABILITADO=1
+ESTADO_RESPALDO_FILE="/home/aalcafuz/zrespaldos/logs/ultimo_backup.estado"
+MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS=93600
+MAX_DURACION_RESPALDO_SEGUNDOS=7200
+SEGUNDOS_COOLDOWN_RESPALDO=86400
+```
+
+`MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS=93600` equivale a 26 horas y permite detectar que el respaldo diario dejó de ejecutarse o dejó de completar correctamente. `MAX_DURACION_RESPALDO_SEGUNDOS=7200` considera anómalo un respaldo que permanezca `EN_PROGRESO` durante más de 2 horas.
+
+El monitor reconoce los estados:
+
+```text
+EN_PROGRESO
+OK
+ERROR
+```
+
+El comportamiento es:
+
+- `OK` reciente: se registra como `INFO` y **no envía notificación**;
+- `ERROR`: genera alerta inmediata;
+- `EN_PROGRESO` dentro de la duración permitida: se registra como `INFO` y no alerta;
+- `EN_PROGRESO` por más de `MAX_DURACION_RESPALDO_SEGUNDOS`: alerta como respaldo posiblemente bloqueado;
+- último `OK` con antigüedad superior a `MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS`: alerta como respaldo atrasado/no ejecutado;
+- archivo de estado ausente: se concede inicialmente una gracia equivalente a `MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS`; si continúa ausente, genera alerta;
+- archivo existente pero no legible, inconsistente o con un estado desconocido: genera alerta.
+
+Las alertas de respaldo utilizan un cooldown propio de `SEGUNDOS_COOLDOWN_RESPALDO`, actualmente 24 horas. Un mismo problema persistente no genera Pushover cada minuto. Sin embargo, un nuevo intento de respaldo con una firma distinta puede alertar inmediatamente si vuelve a fallar.
+
+La recuperación se considera completa únicamente cuando aparece un estado `OK`. Si `ALERTAR_RECUPERACION=1` y existía una anomalía previamente alertada, ese `OK` puede generar la notificación `RECUPERADO` habitual. Un estado `EN_PROGRESO` normal no cierra prematuramente una alerta anterior.
+
+Cada revisión registra un evento `respaldo` en:
+
+```text
+/var/log/monitor-servidor/monitor.log
+```
+
+Según el estado, el registro puede incluir:
+
+```text
+estado
+antiguedad_s o transcurrido_s
+duracion_s
+exit_code
+inicio
+fin
+s3_bd
+s3_pgms
+```
+
+Los valores `s3_bd` y `s3_pgms` son las rutas que el script de respaldo declaró como subidas correctamente. **Esta versión del monitor no consulta S3 para verificar nuevamente la existencia de esos objetos**; esa validación remota puede incorporarse como una mejora independiente.
+
+Las variables anteriores pueden agregarse explícitamente a `monitor-servidor.conf`. Si no están presentes, la shell utiliza los valores por defecto mostrados arriba y `--diagnostico-config` las reportará como variables que todavía no están seteadas explícitamente.
+
+---
+
 ## 9. Apache
 
 El monitor comprueba el servicio configurado, normalmente:
@@ -478,12 +499,6 @@ CPULoad
 
 `APACHE_MAX_REQUEST_WORKERS` en `monitor-servidor.conf` debe coincidir con el valor efectivo configurado en Apache.
 
-### Comportamiento cuando `server-status` no responde
-
-Las conexiones TCP establecidas hacia 80/443 se miden con `ss` y no dependen de `mod_status`. Por eso la alerta de conexiones altas (`apache_conexiones`) se sigue evaluando y notificando —incluida su recuperación— aunque `server-status` no responda.
-
-La saturación de workers (`apache_saturacion`) sí depende de `BusyWorkers`, un dato que solo entrega `server-status`. Si el endpoint deja de responder, esa alerta queda en su último estado conocido hasta que vuelva a responder: no se genera una nueva notificación ni su recuperación mientras tanto, porque no hay forma de saber si la saturación se mantuvo, se resolvió o empeoró. Esa falta de datos queda señalizada de forma independiente por la alerta `apache_status`, que se activa mientras el endpoint esté inaccesible.
-
 ---
 
 ## 10. Logs Apache multisitio
@@ -534,67 +549,6 @@ UMBRAL_APACHE_PHP_ERROR=1
 `PHP Warning`, `PHP Notice` y mensajes `Deprecated` quedan fuera de esta categoría por defecto para reducir ruido. Pueden incorporarse posteriormente ajustando la expresión regular en `monitor-servidor.conf` si se desea vigilarlos.
 
 Cada `sitio + categoría` mantiene su contador independiente y cada `sitio + tipo de log` mantiene su propio cursor. Configuración Apache y PHP / Aplicación utilizan claves de estado separadas, por lo que sus ocurrencias no se mezclan.
-
----
-
-## 10A. SSH: intentos de fuerza bruta
-
-Fuera de los logs de Apache, el monitor no tenía visibilidad de intentos de acceso al propio host. Esta función cuenta las líneas `Failed password` de `auth.log`, agrupadas por IP origen, para detectar fuerza bruta contra SSH.
-
-Se habilita con:
-
-```bash
-CHECK_SSH_AUTH_HABILITADO=1
-SSH_AUTH_LOG="/var/log/auth.log"
-UMBRAL_SSH_FALLOS_IP=5
-VENTANA_SSH_FALLOS_IP_SEGUNDOS=600
-SEGUNDOS_COOLDOWN_SSH_FALLOS_IP=3600
-```
-
-El conteo es **por IP**, no un total global: 50 fallos repartidos entre 50 usuarios que se equivocaron de contraseña es ruido, mientras que 5 fallos desde una sola IP en 10 minutos es un patrón de ataque. Cuando una misma IP acumula `UMBRAL_SSH_FALLOS_IP` fallos dentro de `VENTANA_SSH_FALLOS_IP_SEGUNDOS`, se envía un Pushover con la IP, la cantidad de intentos y hasta 3 nombres de usuario distintos probados. Esa IP respeta además un cooldown independiente (`SEGUNDOS_COOLDOWN_SSH_FALLOS_IP`): mientras el ataque siga activo, no se manda más de una alerta por hora para la misma IP.
-
-Si no hay actividad nueva dentro de la ventana configurada, el contador de esa IP se reinicia en la siguiente ocurrencia; no se acumula indefinidamente a lo largo de días.
-
-El cursor de lectura sigue el mismo mecanismo que los logs Apache: la primera vez que se encuentra `auth.log` sin cursor previo, se posiciona al final del archivo para no generar una alerta con el historial completo ya existente.
-
-Esta función es **solo de visibilidad, no bloquea IPs**. Si además se quiere banear automáticamente a los atacantes, use `fail2ban` (herramienta dedicada a eso) en paralelo; este monitor no reimplementa esa funcionalidad.
-
----
-
-## 10B. Vencimiento de certificados TLS
-
-Certbot puede fallar en silencio de varias formas: su timer se desactiva, el hook post-renovación no recarga Apache y el sitio sigue sirviendo el certificado viejo, la validación HTTP-01 se rompe por un cambio de config o de DNS, o se agotan los rate limits de Let's Encrypt. Esta verificación es independiente de certbot: mide directamente cuántos días le quedan al certificado que Apache **realmente está sirviendo**.
-
-Se habilita con:
-
-```bash
-CHECK_TLS_HABILITADO=1
-SITIOS_TLS=(
-    "vitaticket.cl"
-    "vitacuracorporacioncultural.cl"
-    "www.defacto.cl"
-)
-UMBRAL_TLS_DIAS_RESTANTES=14
-TLS_TIMEOUT_SEGUNDOS=10
-SEGUNDOS_COOLDOWN_TLS=86400
-```
-
-### Por qué se conecta a `127.0.0.1`, no al hostname público
-
-El chequeo hace `openssl s_client -connect 127.0.0.1:443 -servername <sitio>`, usando SNI para seleccionar el vhost en vez de resolver `<sitio>` por DNS pública. Dos razones:
-
-1. **Detecta un hook de recarga que falló.** Si certbot renovó el certificado en disco pero el `--deploy-hook` que recarga Apache no corrió, el archivo en disco está al día pero Apache sigue sirviendo el certificado viejo. Leer el archivo directamente no vería el problema; conectarse de verdad sí.
-2. **No depende de que el DNS público siga apuntando a este servidor.** Si se resolviera `<sitio>` por DNS, un cambio de nameservers o de IP haría que el chequeo evalúe el certificado de otro servidor, no el de este. Conectando siempre a `127.0.0.1` se evalúa exactamente lo que este Apache presenta ahora mismo, sin ese intermediario.
-
-Nota: si un dominio ya no se sirve desde este servidor pero su entrada sigue en `SITIOS_TLS`, esto seguiría evaluando el vhost local (si todavía existe) — no detecta por sí solo que un dominio "se mudó" a otro servidor; para eso haría falta un chequeo de resolución DNS aparte, que queda fuera del alcance de esta función.
-
-### Mecánica
-
-Reutiliza `gestionar_alerta()` — el mismo mecanismo que CPU, memoria y disco — en vez de un acumulador propio, porque "días restantes por debajo de un umbral" es exactamente ese patrón: una métrica que sube y baja, con alerta y recuperación. Esto tiene una ventaja concreta: cuando el certificado vuelve a tener vigencia normal (una renovación real, con recarga de Apache incluida), se envía un Pushover de recuperación — es la confirmación positiva de que el problema se resolvió de punta a punta, no solo que certbot corrió.
-
-Se alerta de inmediato (sin esperar un tiempo sostenido) apenas los días restantes caen a `UMBRAL_TLS_DIAS_RESTANTES` o menos, ya que es una métrica que no fluctúa de un minuto a otro. Si `openssl` no logra conectar o no puede parsear el certificado, se trata como la misma condición de alerta: "no se pudo verificar" es tan accionable como "vence pronto".
-
-`SEGUNDOS_COOLDOWN_TLS` es independiente del cooldown global (`SEGUNDOS_COOLDOWN_ALERTA`) y bastante más largo (24 horas por defecto): re-notificar cada 30 minutos durante dos semanas seguidas sería puro ruido. En cambio, un recordatorio diario mientras el problema siga sin resolverse evita que se pierda entre otras notificaciones, a diferencia de un aviso único de certbot que puede pasar desapercibido.
 
 ---
 
@@ -797,7 +751,6 @@ Se consultan métricas como:
 ```text
 CPUUtilization
 FreeableMemory
-FreeStorageSpace
 SwapUsage
 CPUCreditBalance
 BurstBalance
@@ -808,9 +761,21 @@ Los thresholds se definen en `monitor-servidor.conf`.
 
 `SwapUsage` se correlaciona con `FreeableMemory`; un valor de swap por sí solo no significa necesariamente presión activa de memoria.
 
-`FreeStorageSpace` (`UMBRAL_RDS_STORAGE_LIBRE_MB`) alerta cuando el espacio en disco libre de la instancia cae por debajo del umbral. Sin espacio, RDS puede pasar a modo de solo lectura o caerse — a diferencia de espacio en disco del EC2 (sección 8A), este no se resuelve liberando archivos locales, requiere aumentar el storage asignado a la instancia (o habilitar/ajustar el auto-scaling de storage de RDS).
+`CPUCreditBalance` aplica a familias RDS burstable como T2/T3/T4g. El umbral actual es:
 
-`CPUCreditBalance` aplica a familias RDS burstable como T2/T3/T4g.
+```bash
+UMBRAL_RDS_CPU_CREDIT_BALANCE=50
+```
+
+Para la familia T3, un cambio entre `db.t3.medium` y `db.t3.small` no requiere por sí solo modificar este umbral: ambas clases utilizan 2 vCPU, obtienen 24 créditos de CPU por hora y tienen una utilización base de 20% por vCPU. Por ello se mantiene inicialmente el valor `50` y se recomienda evaluar la tendencia del saldo después del cambio de clase.
+
+Interpretación práctica:
+
+- si `CPUCreditBalance` se recupera progresivamente, la instancia vuelve a acumular reserva de CPU;
+- si permanece durante periodos prolongados cerca del umbral, la carga consume una parte importante de los créditos que se generan;
+- si la tendencia continúa hacia `0`, la instancia tiene poca reserva para burst y conviene revisar la carga o el dimensionamiento.
+
+En instancias T3 también resulta útil observar `CPUSurplusCreditBalance` y `CPUSurplusCreditsCharged`, especialmente si el saldo llega a cero, porque permiten identificar uso de créditos excedentes y posibles cargos asociados. Estas métricas complementarias no forman parte actualmente de las alertas de `monitor-servidor.sh`.
 
 `BurstBalance` es relevante para almacenamiento que expone créditos de I/O, como gp2.
 
@@ -835,67 +800,6 @@ sudo /usr/local/sbin/monitor-servidor.sh --probar-alerta
 ```
 
 Las credenciales Pushover son secretos. Mantenga `monitor-servidor.conf` con permisos `0600` y no publique ese archivo en repositorios ni lo distribuya sin eliminar los secretos.
-
-### Ícono de la aplicación Pushover
-
-La carpeta `imagenes/` contiene el ícono usado en la aplicación Pushover asociada a `API_TOKEN` (`monitor-servidor.png`, `monitor-servidor.jpeg` y `monitor-servidor-128x128.png`). Súbalo al configurar o editar la aplicación en el panel de Pushover; no lo utiliza el script en tiempo de ejecución.
-
----
-
-## 14A. Heartbeat externo ("dead man's switch")
-
-Todas las alertas anteriores dependen de que el propio host esté vivo y de que el monitor se siga ejecutando. Si el servidor se cae por completo, se congela, o el daemon/CRON dejan de ejecutar el monitor, no hay quién dispare Pushover para avisarlo.
-
-Para cubrir ese caso, el monitor puede enviar un ping de heartbeat a un servicio externo tipo [Healthchecks.io](https://healthchecks.io) al final de cada revisión exitosa. Ese servicio, no el propio host, es quien detecta la ausencia de pings y notifica.
-
-Se habilita con:
-
-```bash
-HEALTHCHECKS_HABILITADO=1
-HEALTHCHECKS_URL="https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-HEALTHCHECKS_TIMEOUT=10
-```
-
-Configuración recomendada del lado de Healthchecks.io:
-
-- período de chequeo igual a la cadencia de CRON (1 minuto);
-- un margen de gracia razonable para absorber una revisión puntualmente lenta;
-- la notificación (Pushover, email, etc.) se configura en Healthchecks.io, no en este monitor.
-
-El ping se envía siempre al final de `ejecutar_revision()`, sin importar si algún check anterior generó una alerta. Su único propósito es certificar que el monitor completó un ciclo; no reemplaza ni depende del resto de las alertas. Un fallo aislado al enviarlo solo se registra como `WARN` en `monitor.log`: no se reintenta, porque la garantía real la aporta el servicio externo al notificar la ausencia de pings, no un reintento local.
-
-`HEALTHCHECKS_URL` actúa como secreto y debe tratarse igual que las credenciales de Pushover o MySQL.
-
----
-
-## 14B. Respaldo de notificaciones con ntfy.sh
-
-Pushover puede fallar sin que nadie se entere: `enviar_notificacion()` ya reintenta (`INTENTOS_PUSHOVER`) y deja un `ERROR` en `monitor.log` si todos los intentos fallan, pero eso solo se ve si alguien está mirando el log en ese momento. Como Pushover es el único canal de salida, una falla suya (API caída, credenciales revocadas, egress bloqueado hacia ese dominio específico) degrada en silencio **todas** las alertas del monitor a "una línea de log", sin ninguna señal externa.
-
-[ntfy.sh](https://ntfy.sh) sirve como respaldo para ese caso puntual. Se habilita con:
-
-```bash
-NTFY_HABILITADO=1
-NTFY_URL="https://ntfy.sh/un-topico-largo-y-aleatorio"
-NTFY_TOKEN=""
-NTFY_TIMEOUT=15
-```
-
-### Cuándo se usa
-
-Solo cuando Pushover está habilitado (`PUSHOVER_HABILITADO=1`) pero falla genuinamente: credenciales faltantes, o agotó sus `INTENTOS_PUSHOVER` reintentos. **No** se envía en paralelo con cada notificación normal, y **no** se usa como sustituto si Pushover está deshabilitado a propósito (`PUSHOVER_HABILITADO=0`) — eso es una decisión del administrador, no una falla, y redirigir todo en silencio a otro canal sería sorpresivo.
-
-Cuando el respaldo se usa, queda un `WARN` explícito en el log (`"Pushover falló tras N intentos; ntfy.sh se usó como respaldo"`), y si **ambos** canales fallan, un `ERROR` distinto (`"Pushover y ntfy.sh (si estaba habilitado) fallaron ambos"`) — ese sí es el peor caso real: nadie se enteró de nada por ningún canal.
-
-`NTFY_URL` es la URL completa, tópico incluido: funciona igual con el ntfy.sh público que con una instancia propia self-hosted (en cuyo caso `NTFY_TOKEN` permite autenticarse con `Authorization: Bearer`). En el ntfy.sh público, cualquiera que adivine el nombre del tópico puede leer las notificaciones ahí publicadas o publicar mensajes falsos — use un nombre largo y aleatorio, no algo predecible como `monitor-df-ec2`. Trátelo con el mismo cuidado que `HEALTHCHECKS_URL`.
-
-### Probar el respaldo de forma aislada
-
-```bash
-sudo /usr/local/sbin/monitor-servidor.sh --probar-ntfy
-```
-
-Envía una notificación de prueba directamente por ntfy.sh, sin pasar por Pushover ni depender de que Pushover falle de verdad. Es el análogo de `--probar-alerta` para este canal. A su vez, `--probar-alerta` desactiva el respaldo de ntfy.sh solo durante esa prueba puntual, para que un fallo real de Pushover no quede enmascarado por un ntfy.sh que sí funciona.
 
 ---
 
@@ -923,6 +827,14 @@ SEGUNDOS_COOLDOWN_CRECIMIENTO_DIRECTORIO=86400
 
 Por lo tanto, una misma ruta puede enviar como máximo una alerta de crecimiento cada 24 horas con la configuración actual.
 
+Los respaldos programados utilizan un cooldown independiente:
+
+```bash
+SEGUNDOS_COOLDOWN_RESPALDO=86400
+```
+
+Un mismo problema persistente puede volver a notificarse después de 24 horas. Un nuevo intento de respaldo que falle se considera un evento distinto y puede alertar inmediatamente. Los estados `OK` normales solo se registran; no generan Pushover salvo la recuperación de una anomalía previamente alertada.
+
 Las slow queries detalladas utilizan un cooldown independiente:
 
 ```bash
@@ -930,103 +842,6 @@ SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
 ```
 
 Este cooldown se aplica por fingerprint, por lo que una query lógica ya alertada no vuelve a enviar Pushover durante una hora aunque reaparezca. Otras queries con fingerprint diferente pueden alertar de forma independiente.
-
-### Snapshot de diagnóstico en alertas de CPU/memoria
-
-```bash
-DIAGNOSTICO_PROCESOS_HABILITADO=1
-DIAGNOSTICO_PROCESOS_CANTIDAD=5
-```
-
-Cuando `UMBRAL_CPU_SISTEMA_PCT` o `UMBRAL_MEMORIA_SISTEMA_PCT` se superan, el monitor captura el top de procesos (`pid`, usuario, `%cpu`, `%mem` y nombre del binario) ordenado por la métrica que se disparó, y lo agrega tanto al mensaje de Pushover como a un evento `WARN` en `monitor.log`. El objetivo es evitar tener que entrar por SSH a investigar qué proceso causó el pico, que para cuando se investigue puede que ya haya pasado.
-
-Se registra en cada ejecución donde la condición esté activa, no solo cuando efectivamente se envía Pushover, de modo que el snapshot enviado sea siempre el más cercano posible al momento real del envío.
-
-Solo se incluye el nombre del binario (`comm`), no la línea de comando completa, para no exponer posibles secretos pasados como argumentos a algún proceso.
-
----
-
-## 15A. Verificación puntual de cambio de horario (DST)
-
-Chile cambia de huso horario dos veces al año, en fechas fijadas por decreto (no siempre coinciden con la regla "de libro" que trae `tzdata`). Esta verificación confirma que, tras el cambio, sistema operativo, PHP (vía Apache) y MySQL/RDS reflejen el nuevo offset UTC — evitando tener que entrar por SSH a comprobarlo manualmente.
-
-Se habilita con:
-
-```bash
-CHECK_CAMBIO_HORARIO_HABILITADO=1
-FECHA_CAMBIO_HORARIO="2026-09-06 00:00:00"
-OFFSET_ANTES_CAMBIO_HORARIO="-04:00"
-OFFSET_CAMBIO_HORARIO_ESPERADO="-03:00"
-CAMBIO_HORARIO_PHP_URL="https://www.defacto.cl/monitor-servidor/hora.php"
-VENTANA_CAMBIO_HORARIO_SEGUNDOS=3600
-```
-
-### `OFFSET_ANTES_CAMBIO_HORARIO`: por qué es obligatorio en un adelanto de reloj
-
-En un adelanto de reloj, el instante configurado en `FECHA_CAMBIO_HORARIO` (típicamente `00:00:00`) es una hora local que **nunca llega a existir**: el reloj salta directo de las 00:00:00 a las 01:00:00. Si el propio host ya corre en esa zona horaria, `date -d "2026-09-06 00:00:00"` la rechaza como fecha inválida, porque no hay forma de ubicar ese instante en la línea de tiempo local sin más contexto — y el monitor lo registra como:
-
-```text
-WARN ... [cambio_horario] fecha_invalida=2026-09-06 00:00:00
-```
-
-`OFFSET_ANTES_CAMBIO_HORARIO` resuelve la ambigüedad ancorando la fecha al offset que regía justo antes del cambio (`date -d "2026-09-06 00:00:00 -04:00"`), en vez de dejar que `date` intente adivinarlo con la zona horaria vigente del sistema en ese momento. Para el cambio a horario de invierno (retraso de reloj) esto no es estrictamente necesario porque ahí no hay hueco, solo hora duplicada, pero configurarlo siempre evita tener que recordar en qué caso hace falta.
-
-### Mecánica
-
-En cada ejecución de CRON, si ya pasó `FECHA_CAMBIO_HORARIO` (interpretada según se explica arriba) y esa fecha exacta todavía no fue marcada como procesada:
-
-1. **Sistema operativo**: compara `date +%:z` contra `OFFSET_CAMBIO_HORARIO_ESPERADO`.
-2. **PHP vía Apache**: hace `curl` a `CAMBIO_HORARIO_PHP_URL`, que debe devolver texto plano con el formato `AAAA-mm-dd HH:MM:SS|+HH:MM` (ver más abajo el contenido de `hora.php`), y compara el segundo campo.
-3. **MySQL/RDS**: ejecuta `SELECT TIMESTAMPDIFF(MINUTE, UTC_TIMESTAMP(), NOW());` usando `mysql.cnf`, y convierte la diferencia en minutos a formato `+HH:MM`/`-HH:MM` para compararla. Se calcula por diferencia contra `UTC_TIMESTAMP()` en vez de leer `@@time_zone`, para no depender de si esa variable devuelve un nombre de zona (`America/Santiago`) o un offset numérico.
-
-Si los tres coinciden con `OFFSET_CAMBIO_HORARIO_ESPERADO`, se envía un Pushover de éxito y esa fecha queda marcada como procesada en `/var/lib/monitor-servidor/cambio_horario.estado`: la verificación no se repite hasta que se configure una `FECHA_CAMBIO_HORARIO` distinta (el próximo cambio, típicamente el del año siguiente). Si algo falla, se reintenta en cada ciclo de CRON hasta agotar `VENTANA_CAMBIO_HORARIO_SEGUNDOS` desde `FECHA_CAMBIO_HORARIO`; al agotarse esa ventana sin éxito total, se envía un Pushover de fallo con el detalle de qué chequeo no coincidió, y también se marca como procesada para no reintentar indefinidamente.
-
-Antes de que llegue `FECHA_CAMBIO_HORARIO` la función no hace nada ni deja rastro en el log; no genera ruido mientras espera.
-
-Para validar conectividad y formato de las 3 fuentes antes del cambio real, sin esperar la fecha ni arriesgar el estado persistente, use `--probar-cambio-horario` (ver [sección 6](#6-modos-de-ejecución)).
-
-### Página PHP de referencia
-
-Debe existir en el docroot del sitio, por ejemplo:
-
-```text
-/ztrabajo/www/prod/zsitios/defacto.cl/monitor-servidor/hora.php
-```
-
-Con este contenido:
-
-```php
-<?php
-declare(strict_types=1);
-
-function obtenerOffsetChile(): string
-{
-    $zonaHoraria = new DateTimeZone('America/Santiago');
-    $fechaActual = new DateTime('now', $zonaHoraria);
-
-    return $fechaActual->format('P');
-}
-
-$zonaHoraria = new DateTimeZone('America/Santiago');
-$fechaActual = new DateTime('now', $zonaHoraria);
-
-header('Content-Type: text/plain; charset=utf-8');
-printf("%s|%s\n", $fechaActual->format('Y-m-d H:i:s'), obtenerOffsetChile());
-```
-
-Esta página no la instala ni la gestiona `instalar-monitor-servidor.sh`; debe copiarse manualmente al servidor.
-
-### Para el próximo cambio de horario
-
-Basta con actualizar en `monitor-servidor.conf`:
-
-```bash
-FECHA_CAMBIO_HORARIO="<fecha y hora local del próximo cambio>"
-OFFSET_ANTES_CAMBIO_HORARIO="<offset vigente justo antes, ej. -03:00 antes del retraso a horario de invierno>"
-OFFSET_CAMBIO_HORARIO_ESPERADO="<nuevo offset esperado, ej. -04:00 para el cambio a horario de invierno>"
-```
-
-Al ser distinta de la fecha ya marcada como procesada, la verificación se rearma automáticamente sin tocar `CHECK_CAMBIO_HORARIO_HABILITADO` ni ningún otro archivo.
 
 ---
 
@@ -1081,6 +896,23 @@ sudo grep '"evento":"crecimiento_directorio"' /var/log/monitor-servidor/monitor.
 sudo ls -lh /var/lib/monitor-servidor/snapshots-directorios/
 ```
 
+### 7. Estado del respaldo
+
+Compruebe primero el archivo producido por `z_crea_respaldo.sh`:
+
+```bash
+sudo cat /home/aalcafuz/zrespaldos/logs/ultimo_backup.estado
+```
+
+Luego ejecute una revisión y consulte los eventos del monitor:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --una-vez
+sudo grep '"evento":"respaldo"' /var/log/monitor-servidor/monitor.log | tail -20
+```
+
+Un respaldo sano debe mostrar `estado=OK` sin generar Pushover.
+
 ---
 
 ## 17. Diagnóstico rápido
@@ -1133,6 +965,36 @@ sudo time du -skx -- /ruta/a/revisar
 
 Si el directorio es muy grande, revise `TIMEOUT_DU_DIRECTORIO` antes de aumentarlo. El objetivo es evitar que una medición pesada bloquee una ejecución completa del monitor.
 
+### Eventos `respaldo` con `estado=ERROR`
+
+Revise el log propio del script de respaldo y el archivo de estado:
+
+```bash
+sudo tail -n 100 /home/aalcafuz/zrespaldos/logs/backup_s3.log
+sudo cat /home/aalcafuz/zrespaldos/logs/ultimo_backup.estado
+```
+
+El `exit_code`, inicio, fin y duración registrados ayudan a identificar el intento que falló.
+
+### Eventos `respaldo` con `resultado=ATRASADO`
+
+El último `OK` supera `MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS`. Compruebe que el CRON de `z_crea_respaldo.sh backup` siga instalado y ejecutándose en el horario esperado.
+
+### Eventos `respaldo` con `resultado=EXCEDIDO`
+
+El archivo continúa en `EN_PROGRESO` durante más de `MAX_DURACION_RESPALDO_SEGUNDOS`. Revise si siguen activos `mysqldump`, `tar`, `aws s3 cp` o el propio `z_crea_respaldo.sh` antes de finalizar procesos manualmente.
+
+### Eventos `respaldo` con `estado=SIN_ESTADO`, `NO_LEGIBLE` o `INVALIDO`
+
+Compruebe existencia, permisos y contenido:
+
+```bash
+sudo ls -l /home/aalcafuz/zrespaldos/logs/ultimo_backup.estado
+sudo cat /home/aalcafuz/zrespaldos/logs/ultimo_backup.estado
+```
+
+`SIN_ESTADO` no alerta inmediatamente en una instalación nueva: el monitor concede la ventana configurada por `MAX_ANTIGUEDAD_RESPALDO_SEGUNDOS` antes de considerarlo una anomalía.
+
 ### `aws_cli=no_instalado`
 
 Compruebe:
@@ -1176,24 +1038,6 @@ sudo systemctl status cron
 sudo grep -E 'inicio_revision|fin_revision' /var/log/monitor-servidor/monitor.log | tail
 ```
 
-### Evento `heartbeat` con `WARN`
-
-Compruebe manualmente el ping:
-
-```bash
-curl -v "https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-```
-
-Revise conectividad de salida hacia Healthchecks.io, `HEALTHCHECKS_URL` en `monitor-servidor.conf` y `HEALTHCHECKS_HABILITADO=1`. Un fallo aislado no es crítico: el propio Healthchecks.io notificará si los pings dejan de llegar dentro del período configurado ahí.
-
-### Evento `cambio_horario` con `fecha_invalida=...`
-
-`FECHA_CAMBIO_HORARIO` cae en una hora local que no existe (típico en un adelanto de reloj, ej. `00:00:00` cuando el reloj salta directo a la `01:00:00`) y `date -d` no puede resolverla sin ayuda. Configure `OFFSET_ANTES_CAMBIO_HORARIO` con el offset vigente justo antes del cambio (ver [sección 15A](#15a-verificación-puntual-de-cambio-de-horario-dst)). Puede validar la corrección con:
-
-```bash
-sudo /usr/local/sbin/monitor-servidor.sh --probar-cambio-horario
-```
-
 ---
 
 ## 18. Reinstalación y actualización
@@ -1216,14 +1060,6 @@ El directorio persistente:
 ```
 
 no se elimina durante una reinstalación, por lo que se conservan cursores, cooldowns y contadores.
-
-**Nota importante:** el instalador reemplaza `monitor-servidor.conf` por completo; no fusiona variables nuevas con la configuración existente. Si en vez de usar el instalador se actualiza `monitor-servidor.conf` a mano (copiando bloques nuevos desde `monitor-servidor.conf.sample`), corra después:
-
-```bash
-sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
-```
-
-para confirmar que ninguna variable de una funcionalidad nueva quedó sin setear.
 
 ---
 
