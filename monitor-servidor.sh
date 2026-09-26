@@ -197,6 +197,14 @@ RDS_DB_INSTANCE_ID="${RDS_DB_INSTANCE_ID:-}"
 EC2_INSTANCE_ID="${EC2_INSTANCE_ID:-}"
 AWS_INTENTOS="${AWS_INTENTOS:-2}"
 
+# Queries MySQL actualmente en ejecución. Complementa el Slow Query Log porque
+# este último solo registra una consulta cuando termina; una query bloqueada o
+# descontrolada puede detectarse aquí mientras todavía está consumiendo recursos.
+CHECK_MYSQL_QUERY_ACTIVA_HABILITADO="${CHECK_MYSQL_QUERY_ACTIVA_HABILITADO:-1}"
+UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS="${UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS:-60}"
+UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS="${UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS:-300}"
+SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA="${SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA:-3600}"
+
 # Detalle de slow queries desde el Slow Query Log de RDS exportado a CloudWatch Logs.
 CHECK_MYSQL_SLOW_QUERY_DETAILS="${CHECK_MYSQL_SLOW_QUERY_DETAILS:-false}"
 MYSQL_SLOW_QUERY_LOG_GROUP="${MYSQL_SLOW_QUERY_LOG_GROUP:-}"
@@ -208,7 +216,15 @@ SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY="${SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY:-3600}"
 MYSQL_SLOW_QUERY_USUARIOS_BACKUP="${MYSQL_SLOW_QUERY_USUARIOS_BACKUP:-backup_user}"
 UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS="${UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS:-120}"
 MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS="${MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS:-700}"
-MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS="${MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS:-3600}"
+
+# Patrones de alta confianza que deben alertar desde la primera slow query, sin
+# esperar el umbral normal de duración/repetición. La comparación es case-insensitive.
+CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO="${CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO:-1}"
+REGEX_MYSQL_SLOW_QUERY_SEGURIDAD="${REGEX_MYSQL_SLOW_QUERY_SEGURIDAD:-SLEEP[[:space:]]*\\(|BENCHMARK[[:space:]]*\\(}"
+
+# Reconsulta 24 horas para recuperar eventos publicados tarde por RDS. Los
+# eventId persistentes evitan procesar dos veces una entrada ya conocida.
+MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS="${MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS:-86400}"
 UMBRAL_RDS_CPU_PCT="${UMBRAL_RDS_CPU_PCT:-80}"
 UMBRAL_RDS_MEMORIA_LIBRE_MB="${UMBRAL_RDS_MEMORIA_LIBRE_MB:-1024}"
 UMBRAL_RDS_STORAGE_LIBRE_MB="${UMBRAL_RDS_STORAGE_LIBRE_MB:-2048}"
@@ -314,7 +330,7 @@ categoria_de_variable() {
             printf 'SSH: fuerza bruta' ;;
         CHECK_TLS_HABILITADO|UMBRAL_TLS_DIAS_RESTANTES|TLS_TIMEOUT_SEGUNDOS|SEGUNDOS_COOLDOWN_TLS)
             printf 'Certificados TLS' ;;
-        MYSQL_CNF|MYSQL_TIMEOUT|MYSQL_INTENTOS|UMBRAL_MYSQL_CONEXIONES_PCT|UMBRAL_MYSQL_THREADS_RUNNING|TIEMPO_SOSTENIDO_MYSQL|UMBRAL_MYSQL_SLOW_POR_MINUTO|CHECK_MYSQL_SLOW_QUERY_DETAILS|MYSQL_SLOW_QUERY_LOG_GROUP|UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES|VENTANA_MYSQL_SLOW_QUERY_REPETICIONES|SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY|MYSQL_SLOW_QUERY_USUARIOS_BACKUP|UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS|MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS)
+        MYSQL_CNF|MYSQL_TIMEOUT|MYSQL_INTENTOS|UMBRAL_MYSQL_CONEXIONES_PCT|UMBRAL_MYSQL_THREADS_RUNNING|TIEMPO_SOSTENIDO_MYSQL|UMBRAL_MYSQL_SLOW_POR_MINUTO|CHECK_MYSQL_QUERY_ACTIVA_HABILITADO|UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS|UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS|SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA|CHECK_MYSQL_SLOW_QUERY_DETAILS|MYSQL_SLOW_QUERY_LOG_GROUP|UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES|VENTANA_MYSQL_SLOW_QUERY_REPETICIONES|SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY|MYSQL_SLOW_QUERY_USUARIOS_BACKUP|UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS|MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS|CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO|REGEX_MYSQL_SLOW_QUERY_SEGURIDAD|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS)
             printf 'MySQL / RDS' ;;
         AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_STORAGE_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS)
             printf 'AWS CLI / CloudWatch' ;;
@@ -2017,6 +2033,190 @@ monitorear_mysql() {
         "Tasa de queries lentas MySQL normalizada: ${slow_por_minuto}/min."
 }
 
+# Obtiene las consultas MySQL que están ejecutándose en este instante. Se
+# excluye la propia consulta del monitor y se normalizan tabs/saltos de línea
+# para conservar una fila TSV estable por proceso. Para ver sesiones de otros
+# usuarios, la cuenta del monitor debe disponer del privilegio PROCESS.
+ejecutar_mysql_processlist() {
+    local intento salida
+
+    if ! command -v mysql >/dev/null 2>&1; then
+        return 127
+    fi
+
+    if [[ ! -r "$MYSQL_CNF" ]]; then
+        return 126
+    fi
+
+    for ((intento = 1; intento <= MYSQL_INTENTOS; intento++)); do
+        if salida="$(mysql \
+            --defaults-extra-file="$MYSQL_CNF" \
+            --connect-timeout="$MYSQL_TIMEOUT" \
+            --batch \
+            --skip-column-names \
+            --execute="
+                SELECT
+                    ID,
+                    COALESCE(NULLIF(USER, ''), '-'),
+                    COALESCE(NULLIF(HOST, ''), '-'),
+                    COALESCE(NULLIF(DB, ''), '-'),
+                    COALESCE(NULLIF(COMMAND, ''), '-'),
+                    TIME,
+                    REPLACE(REPLACE(REPLACE(COALESCE(NULLIF(STATE, ''), '-'), CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' '),
+                    REPLACE(REPLACE(REPLACE(COALESCE(NULLIF(INFO, ''), '-'), CHAR(13), ' '), CHAR(10), ' '), CHAR(9), ' ')
+                FROM information_schema.PROCESSLIST
+                WHERE COMMAND <> 'Sleep'
+                  AND INFO IS NOT NULL
+                  AND ID <> CONNECTION_ID();
+            " 2>/dev/null)"; then
+            printf '%s\n' "$salida"
+            return 0
+        fi
+
+        sleep "$SEGUNDOS_ENTRE_REINTENTOS"
+    done
+
+    return 1
+}
+
+# Supervisa queries actualmente activas para detectar una consulta problemática
+# antes de que termine y aparezca en el Slow Query Log. Una misma query puede
+# alertar al superar el umbral normal y volver a alertar inmediatamente al
+# escalar al umbral crítico; después se aplica su cooldown propio.
+monitorear_mysql_queries_activas() {
+    local salida rc ahora id usuario host_mysql schema comando duracion estado sql
+    local umbral_actual nivel_objetivo nivel_alertado ultima_alerta fingerprint fingerprint_anterior
+    local archivo_estado archivo titulo mensaje prioridad sql_pushover es_backup
+    local -A activas=()
+
+    if ! booleano_habilitado "$CHECK_MYSQL_QUERY_ACTIVA_HABILITADO"; then
+        return 0
+    fi
+
+    if ! es_numero "$UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS" \
+        || ! es_numero "$UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS" \
+        || ! es_numero "$SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA"; then
+        registrar "WARN" "mysql_query_activa" "configuracion_invalida umbral_s=${UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS} critica_s=${UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS} cooldown_s=${SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA}"
+        return 0
+    fi
+
+    salida="$(ejecutar_mysql_processlist)"
+    rc=$?
+    if (( rc != 0 )); then
+        registrar "WARN" "mysql_query_activa" "processlist=no_disponible codigo=${rc}"
+        return 0
+    fi
+
+    ahora="$(date +%s)"
+
+    while IFS=$'\t' read -r id usuario host_mysql schema comando duracion estado sql; do
+        [[ -n "$id" ]] || continue
+        [[ "$id" =~ ^[0-9]+$ && "$duracion" =~ ^[0-9]+$ ]] || {
+            registrar "WARN" "mysql_query_activa" "processlist=fila_invalida id=${id:-vacio} duracion=${duracion:-vacio}"
+            continue
+        }
+
+        es_backup=0
+        umbral_actual="$UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS"
+        if usuario_mysql_slow_es_backup "$usuario"; then
+            es_backup=1
+            umbral_actual="$UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS"
+        fi
+
+        if ! mayor_igual "$duracion" "$umbral_actual"; then
+            continue
+        fi
+
+        activas["$id"]=1
+        fingerprint="$(printf '%s\0%s\0%s\0%s' "$usuario" "$host_mysql" "$schema" "$sql" | sha256sum | awk '{print $1}')"
+        archivo_estado="${DIRECTORIO_ESTADO}/mysql_query_activa_${id}.estado"
+        fingerprint_anterior=""
+        ultima_alerta=0
+        nivel_alertado=0
+
+        if [[ -r "$archivo_estado" ]]; then
+            IFS='|' read -r fingerprint_anterior ultima_alerta nivel_alertado < "$archivo_estado" || true
+            ultima_alerta="${ultima_alerta:-0}"
+            nivel_alertado="${nivel_alertado:-0}"
+        fi
+        [[ "$ultima_alerta" =~ ^[0-9]+$ ]] || ultima_alerta=0
+        [[ "$nivel_alertado" =~ ^[0-2]$ ]] || nivel_alertado=0
+
+        if [[ -n "$fingerprint_anterior" && "$fingerprint_anterior" != "$fingerprint" ]]; then
+            if (( nivel_alertado > 0 )) && [[ "$ALERTAR_RECUPERACION" == "1" ]]; then
+                enviar_notificacion \
+                    "RECUPERADO - ${NOMBRE_SERVIDOR}" \
+                    "La query MySQL activa anterior ID=${id} finalizó o cambió de sentencia." \
+                    0 || true
+            fi
+            ultima_alerta=0
+            nivel_alertado=0
+        fi
+
+        nivel_objetivo=1
+        if mayor_igual "$duracion" "$UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS"; then
+            nivel_objetivo=2
+        fi
+
+        prioridad=0
+        titulo="Query MySQL activa prolongada - ${NOMBRE_SERVIDOR}"
+        if (( nivel_objetivo == 2 )); then
+            prioridad=1
+            titulo="Query MySQL activa CRÍTICA - ${NOMBRE_SERVIDOR}"
+        fi
+        if (( es_backup == 1 )); then
+            titulo="${titulo/Query MySQL/Query MySQL Backup}"
+        fi
+
+        sql_pushover="$sql"
+        if (( ${#sql_pushover} > MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS )); then
+            sql_pushover="${sql_pushover:0:MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS}…"
+        fi
+
+        if (( nivel_alertado == 0 \
+            || nivel_objetivo > nivel_alertado \
+            || ahora - ultima_alerta >= SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA )); then
+            mensaje="ID=${id}; usuario=${usuario}; host=${host_mysql}; base=${schema}; comando=${comando}.
+Duración actual=${duracion}s; umbral=${umbral_actual}s; crítico=${UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS}s; estado=${estado}.
+SQL:
+${sql_pushover}
+Fingerprint=${fingerprint}"
+
+            if enviar_notificacion "$titulo" "$mensaje" "$prioridad"; then
+                ultima_alerta="$ahora"
+                nivel_alertado="$nivel_objetivo"
+            fi
+        fi
+
+        registrar "WARN" "mysql_query_activa" "id=${id} usuario=${usuario} host=${host_mysql} base=${schema} comando=${comando} duracion_s=${duracion} umbral_s=${umbral_actual} critica_s=${UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS} nivel=${nivel_objetivo} backup=${es_backup} fingerprint=${fingerprint} sql=${sql}"
+        printf '%s|%s|%s\n' "$fingerprint" "$ultima_alerta" "$nivel_alertado" > "$archivo_estado"
+    done <<< "$salida"
+
+    # Todo estado que ya no aparece entre las queries sobre umbral se considera
+    # recuperado: la sentencia terminó, cambió o dejó de superar el límite.
+    for archivo in "$DIRECTORIO_ESTADO"/mysql_query_activa_*.estado; do
+        [[ -f "$archivo" ]] || continue
+        id="$(basename "$archivo" .estado)"
+        id="${id#mysql_query_activa_}"
+        [[ -n "${activas[$id]:-}" ]] && continue
+
+        fingerprint_anterior=""
+        ultima_alerta=0
+        nivel_alertado=0
+        IFS='|' read -r fingerprint_anterior ultima_alerta nivel_alertado < "$archivo" || true
+        nivel_alertado="${nivel_alertado:-0}"
+        [[ "$nivel_alertado" =~ ^[0-2]$ ]] || nivel_alertado=0
+
+        if (( nivel_alertado > 0 )) && [[ "$ALERTAR_RECUPERACION" == "1" ]]; then
+            enviar_notificacion \
+                "RECUPERADO - ${NOMBRE_SERVIDOR}" \
+                "La query MySQL activa ID=${id} ya no supera el umbral o finalizó." \
+                0 || true
+        fi
+        rm -f "$archivo"
+    done
+}
+
 ###############################################################################
 # AWS CLI: estado EC2/RDS y métricas CloudWatch
 ###############################################################################
@@ -2234,7 +2434,7 @@ PY_SLOW_QUERY
 }
 
 # Procesa una slow query individual, actualiza su estado por fingerprint y decide
-# si corresponde enviar Pushover según duración, repetición, backup y cooldown.
+# si corresponde enviar Pushover según seguridad, duración, repetición, backup y cooldown.
 #
 # Argumentos:
 #   1: eventId.
@@ -2265,7 +2465,7 @@ procesar_evento_mysql_slow() {
     local archivo_estado="${DIRECTORIO_ESTADO}/mysql_slow_query_${fingerprint}.estado"
     local ventana_inicio=0 ocurrencias=0 ultima_alerta=0 duracion_maxima="0"
     local evento_segundos ahora alerta=0 es_backup=0 incrementar_ocurrencias=0 motivo="" pushover_estado="omitido"
-    local sql_pushover titulo mensaje
+    local es_sospechosa=0 prioridad_alerta=0 sql_pushover titulo mensaje
 
     if evento_mysql_slow_ya_procesado "$event_id"; then
         return 0
@@ -2287,6 +2487,12 @@ procesar_evento_mysql_slow() {
     [[ "$ultima_alerta" =~ ^[0-9]+$ ]] || ultima_alerta=0
     es_numero "$duracion_maxima" || duracion_maxima="0"
 
+    if booleano_habilitado "$CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO" \
+        && [[ -n "$REGEX_MYSQL_SLOW_QUERY_SEGURIDAD" ]] \
+        && printf '%s\n' "$sql" | grep -Eiq -- "$REGEX_MYSQL_SLOW_QUERY_SEGURIDAD"; then
+        es_sospechosa=1
+    fi
+
     if usuario_mysql_slow_es_backup "$usuario"; then
         es_backup=1
         incrementar_ocurrencias=1
@@ -2307,7 +2513,11 @@ procesar_evento_mysql_slow() {
         fi
     fi
 
-    if (( es_backup == 1 )); then
+    if (( es_sospechosa == 1 )); then
+        alerta=1
+        motivo="seguridad_sql"
+        prioridad_alerta=1
+    elif (( es_backup == 1 )); then
         if mayor_igual "$duracion" "$UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS"; then
             alerta=1
             motivo="backup_duracion"
@@ -2331,7 +2541,9 @@ procesar_evento_mysql_slow() {
                 sql_pushover="${sql_pushover:0:MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS}…"
             fi
 
-            if (( es_backup == 1 )); then
+            if (( es_sospechosa == 1 )); then
+                titulo="SQL sospechoso MySQL - ${NOMBRE_SERVIDOR}"
+            elif (( es_backup == 1 )); then
                 titulo="Slow Query MySQL Backup - ${NOMBRE_SERVIDOR}"
             else
                 titulo="Slow Query MySQL - ${NOMBRE_SERVIDOR}"
@@ -2345,7 +2557,7 @@ SQL:
 ${sql_pushover}
 Fingerprint=${fingerprint}"
 
-            if enviar_notificacion "$titulo" "$mensaje" 0; then
+            if enviar_notificacion "$titulo" "$mensaje" "$prioridad_alerta"; then
                 ultima_alerta="$ahora"
                 pushover_estado="enviado"
             else
@@ -2354,7 +2566,7 @@ Fingerprint=${fingerprint}"
         fi
     fi
 
-    registrar "WARN" "mysql_slow_query" "usuario=${usuario} host=${host_mysql:-desconocido} base=${schema:-desconocida} duracion_s=${duracion} lock_s=${lock_time} rows_sent=${rows_sent} rows_examined=${rows_examined} ocurrencias_ventana=${ocurrencias} duracion_maxima_s=${duracion_maxima} backup=${es_backup} pushover=${pushover_estado} motivo=${motivo:-ninguno} fingerprint=${fingerprint} event_id=${event_id} fecha=${timestamp_iso:-desconocida} sql=${sql}"
+    registrar "WARN" "mysql_slow_query" "usuario=${usuario} host=${host_mysql:-desconocido} base=${schema:-desconocida} duracion_s=${duracion} lock_s=${lock_time} rows_sent=${rows_sent} rows_examined=${rows_examined} ocurrencias_ventana=${ocurrencias} duracion_maxima_s=${duracion_maxima} backup=${es_backup} seguridad_sql=${es_sospechosa} pushover=${pushover_estado} motivo=${motivo:-ninguno} fingerprint=${fingerprint} event_id=${event_id} fecha=${timestamp_iso:-desconocida} sql=${sql}"
 
     printf '%s|%s|%s|%s\n' "$ventana_inicio" "$ocurrencias" "$ultima_alerta" "$duracion_maxima" > "$archivo_estado"
     registrar_evento_mysql_slow_procesado "$event_id"
@@ -2933,6 +3145,7 @@ ejecutar_revision() {
     monitorear_ssh_auth
     monitorear_certificados_tls
     monitorear_mysql
+    monitorear_mysql_queries_activas
     monitorear_mysql_slow_queries
     monitorear_aws
     monitorear_cambio_horario
