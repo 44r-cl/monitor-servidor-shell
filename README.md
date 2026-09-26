@@ -260,6 +260,7 @@ Ahí se almacenan, entre otros:
 - contadores Apache por sitio y categoría;
 - cursores de `error.log` y `access.log`;
 - contador anterior de `Slow_queries` de MySQL;
+- estado por ID/fingerprint de queries MySQL activas, incluyendo nivel alertado y cooldown;
 - cursor de lectura del Slow Query Log en CloudWatch;
 - `eventId` recientes de slow queries para evitar reprocesamiento;
 - estado por fingerprint de slow queries, incluyendo repeticiones y cooldown;
@@ -580,9 +581,77 @@ Slow_queries
 Uptime
 max_connections
 long_query_time
+information_schema.PROCESSLIST
 ```
 
-`Slow_queries` es acumulativo; el monitor conserva el valor anterior y calcula la tasa aproximada de nuevas slow queries por minuto. Esta supervisión agregada existente se mantiene independiente del análisis detallado descrito a continuación.
+`Slow_queries` es acumulativo; el monitor conserva el valor anterior y calcula la tasa aproximada de nuevas slow queries por minuto. Esta supervisión agregada se mantiene independiente del monitoreo de queries actualmente en ejecución y del análisis detallado del Slow Query Log.
+
+### Queries MySQL actualmente en ejecución
+
+El Slow Query Log solo permite analizar una consulta después de que termina y se publica en el log. Para detectar una query bloqueada, descontrolada o de larga duración mientras todavía está ejecutándose, el monitor consulta `information_schema.PROCESSLIST` en cada revisión.
+
+Esta función se habilita con:
+
+```bash
+CHECK_MYSQL_QUERY_ACTIVA_HABILITADO=1
+UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS=60
+UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS=300
+SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA=3600
+```
+
+Se excluyen la propia conexión del monitor, las sesiones con `COMMAND='Sleep'` y las filas sin SQL activo. Para cada query sobre el umbral se registran, entre otros:
+
+```text
+ID
+usuario
+host
+base de datos
+comando
+duración actual
+estado
+SQL
+fingerprint
+```
+
+Para usuarios normales, una query se considera prolongada al alcanzar `UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS`, actualmente 60 segundos. Al llegar a `UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS`, actualmente 300 segundos, escala a nivel crítico y se envía una nueva alerta aunque la primera todavía esté dentro del cooldown.
+
+Los usuarios incluidos en `MYSQL_SLOW_QUERY_USUARIOS_BACKUP`, actualmente `backup_user`, reutilizan como umbral de query activa `UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS`, actualmente 120 segundos. Esto evita alertar por operaciones de respaldo legítimas que suelen durar más que las consultas normales.
+
+La alerta inicial de query prolongada usa prioridad normal de Pushover; la alerta crítica usa prioridad alta. Después de cada nivel se aplica `SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA`, actualmente una hora. Cuando una query previamente alertada termina, cambia o deja de superar el umbral, puede generarse `RECUPERADO` si `ALERTAR_RECUPERACION=1`.
+
+Como la instalación recomendada ejecuta CRON una vez por minuto, el momento real de aviso depende de la alineación entre el inicio de la consulta y la siguiente revisión. Con los valores actuales, una query normal que supera 60 segundos suele detectarse aproximadamente entre 60 y 120 segundos; para `backup_user`, entre 120 y 180 segundos.
+
+#### Privilegio `PROCESS`
+
+Para que la cuenta usada por `mysql.cnf` pueda ver las sesiones de otros usuarios, necesita el privilegio global `PROCESS`. Sin ese privilegio MySQL limita la visibilidad del process list y el monitor puede no observar una query problemática ejecutada por otra cuenta.
+
+Compruebe la cuenta efectiva y sus grants:
+
+```bash
+sudo mysql \
+    --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+    -e "SELECT CURRENT_USER(); SHOW GRANTS;"
+```
+
+El grant mínimo adicional para esta función es conceptualmente:
+
+```sql
+GRANT PROCESS ON *.* TO 'usuario_monitor'@'%';
+```
+
+Debe ejecutarlo una cuenta administrativa autorizada. No es necesario otorgar permisos de escritura sobre las bases de aplicación para consultar `PROCESSLIST`.
+
+Prueba manual de visibilidad:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  --batch --skip-column-names \
+  -e "SELECT ID, USER, HOST, COALESCE(DB,'-'), COMMAND, TIME, COALESCE(STATE,'-'), LEFT(COALESCE(INFO,''),200)
+FROM information_schema.PROCESSLIST
+WHERE ID <> CONNECTION_ID()
+ORDER BY TIME DESC;"
+```
 
 ### Detalle de Slow Query Log
 
@@ -620,7 +689,9 @@ SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
 MYSQL_SLOW_QUERY_USUARIOS_BACKUP="backup_user"
 UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS=120
 MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS=700
-MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS=3600
+CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO=1
+REGEX_MYSQL_SLOW_QUERY_SEGURIDAD='SLEEP[[:space:]]*\(|BENCHMARK[[:space:]]*\('
+MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS=86400
 ```
 
 Para usuarios normales se aplican estas reglas:
@@ -630,7 +701,22 @@ Para usuarios normales se aplican estas reglas:
 - una consulta de 15 segundos o más puede alertar desde la primera ocurrencia;
 - la misma query lógica puede enviar como máximo un Pushover por hora.
 
-Los usuarios indicados en `MYSQL_SLOW_QUERY_USUARIOS_BACKUP`, actualmente `backup_user`, tienen tratamiento especial: todas sus slow queries se registran, pero solamente generan Pushover si alcanzan 120 segundos o más.
+Los usuarios indicados en `MYSQL_SLOW_QUERY_USUARIOS_BACKUP`, actualmente `backup_user`, tienen tratamiento especial para las reglas normales de duración: todas sus slow queries se registran, pero solamente generan Pushover por duración si alcanzan 120 segundos o más.
+
+### Patrones SQL sospechosos
+
+El análisis detallado puede aplicar además una regla de seguridad independiente de los thresholds normales:
+
+```bash
+CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO=1
+REGEX_MYSQL_SLOW_QUERY_SEGURIDAD='SLEEP[[:space:]]*\(|BENCHMARK[[:space:]]*\('
+```
+
+La comparación es case-insensitive. Si el SQL contiene alguno de estos patrones de alta confianza, la entrada alerta desde la primera ocurrencia con el título `SQL sospechoso MySQL - ...` y prioridad alta, sin esperar las 3 repeticiones, los 15 segundos del umbral normal ni los 120 segundos reservados a `backup_user`.
+
+Esta regla está diseñada para detectar rápidamente payloads de temporización como `SLEEP(...)` o `BENCHMARK(...)` que pueden aparecer en intentos de SQL injection. No sustituye el uso de consultas parametrizadas, validación de entrada ni otras medidas preventivas de la aplicación.
+
+El Slow Query Log continúa teniendo una limitación fundamental: una consulta aparece allí cuando termina. Por eso esta regla complementa, pero no reemplaza, el monitoreo de `PROCESSLIST`; una query maliciosa que siga ejecutándose durante minutos u horas debe ser detectada primero por `mysql_query_activa`.
 
 El monitor extrae de cada entrada, cuando están disponibles:
 
@@ -652,9 +738,9 @@ El SQL completo procesado se registra en `monitor.log`. Pushover recibe como má
 
 ### Lectura incremental de CloudWatch Logs
 
-La primera vez que se habilita esta función, el monitor inicializa el cursor en el momento actual y **no procesa el historial anterior**. En las siguientes ejecuciones reconsulta una ventana anterior de una hora para absorber posibles retrasos de ingestión desde RDS.
+La primera vez que se habilita esta función, el monitor inicializa el cursor en el momento actual y **no procesa el historial anterior**. En las siguientes ejecuciones reconsulta una ventana anterior de 24 horas (`MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS=86400`) para absorber entradas que RDS/CloudWatch publique con retraso, incluso si la consulta terminó muchas horas después de haber comenzado.
 
-Cada entrada de CloudWatch se identifica mediante su `eventId`. Los IDs ya procesados se conservan temporalmente en el estado persistente, por lo que el solapamiento no hace que la misma slow query se registre o alerte repetidamente.
+Cada entrada de CloudWatch se identifica mediante su `eventId`. Los IDs ya procesados se conservan temporalmente en el estado persistente, por lo que ampliar el solapamiento a 24 horas no hace que la misma slow query se registre o alerte repetidamente.
 
 Prueba manual del log group actual:
 
@@ -835,13 +921,21 @@ SEGUNDOS_COOLDOWN_RESPALDO=86400
 
 Un mismo problema persistente puede volver a notificarse después de 24 horas. Un nuevo intento de respaldo que falle se considera un evento distinto y puede alertar inmediatamente. Los estados `OK` normales solo se registran; no generan Pushover salvo la recuperación de una anomalía previamente alertada.
 
-Las slow queries detalladas utilizan un cooldown independiente:
+Las queries MySQL actualmente en ejecución utilizan un cooldown independiente:
+
+```bash
+SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA=3600
+```
+
+El estado se mantiene por conexión activa. Una query puede alertar al superar el umbral normal y volver a alertar inmediatamente si escala al umbral crítico de 300 segundos; después se aplica el cooldown propio. Cuando la query termina o deja de superar el umbral, su estado se elimina y puede generarse recuperación.
+
+Las slow queries detalladas utilizan otro cooldown independiente:
 
 ```bash
 SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
 ```
 
-Este cooldown se aplica por fingerprint, por lo que una query lógica ya alertada no vuelve a enviar Pushover durante una hora aunque reaparezca. Otras queries con fingerprint diferente pueden alertar de forma independiente.
+Este cooldown se aplica por fingerprint, por lo que una query lógica ya alertada no vuelve a enviar Pushover durante una hora aunque reaparezca. Otras queries con fingerprint diferente pueden alertar de forma independiente. Una coincidencia con `REGEX_MYSQL_SLOW_QUERY_SEGURIDAD` conserva este cooldown por fingerprint, pero no necesita cumplir los thresholds normales de duración o repetición para generar su primera alerta.
 
 ---
 
@@ -912,6 +1006,37 @@ sudo grep '"evento":"respaldo"' /var/log/monitor-servidor/monitor.log | tail -20
 ```
 
 Un respaldo sano debe mostrar `estado=OK` sin generar Pushover.
+
+### 8. Queries MySQL activas
+
+Compruebe primero que la cuenta del monitor pueda ver sesiones de otros usuarios:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  --batch --skip-column-names \
+  -e "SELECT ID,USER,HOST,COMMAND,TIME,STATE,INFO
+FROM information_schema.PROCESSLIST
+WHERE ID <> CONNECTION_ID()
+ORDER BY TIME DESC;"
+```
+
+Para una prueba controlada con la cuenta `backup_user`, puede mantener una consulta inofensiva durante más tiempo que su umbral de 120 segundos:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  -e "SELECT SLEEP(200);"
+```
+
+En otra consola observe:
+
+```bash
+sudo tail -f /var/log/monitor-servidor/monitor.log \
+  | grep --line-buffered -E 'mysql_query_activa|mysql_slow_query|pushover'
+```
+
+Con CRON cada minuto, `backup_user` debería generar `Query MySQL Backup activa prolongada` cuando alguna revisión la observe sobre 120 segundos, normalmente entre 120 y 180 segundos desde el inicio. Al terminar debería generarse la recuperación. Como `SLEEP(...)` coincide además con la regla de SQL sospechoso, después de que RDS publique la entrada en el Slow Query Log puede aparecer una segunda alerta independiente con el título `SQL sospechoso MySQL - ...`.
 
 ---
 
@@ -1014,6 +1139,22 @@ Si utiliza perfil:
 sudo aws --profile nombre-del-perfil --region us-east-2 sts get-caller-identity
 ```
 
+### `mysql_query_activa` con `processlist=no_disponible` o sin visibilidad de otras sesiones
+
+Pruebe directamente `information_schema.PROCESSLIST` con la misma cuenta del monitor:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  --batch --skip-column-names \
+  -e "SELECT ID,USER,HOST,COMMAND,TIME,STATE,INFO
+FROM information_schema.PROCESSLIST
+WHERE ID <> CONNECTION_ID()
+ORDER BY TIME DESC;"
+```
+
+Si el comando falla, revise conectividad, `mysql.cnf` y permisos. Si funciona pero solo permite ver las propias sesiones, compruebe `SHOW GRANTS` y que la cuenta tenga el privilegio global `PROCESS`.
+
 ### `mysql_slow_query` con `cloudwatch=no_disponible`
 
 Compruebe directamente el acceso al Slow Query Log:
@@ -1107,6 +1248,6 @@ Mantenga al menos:
 /var/log/monitor-servidor/monitor.log       0600 root:root
 ```
 
-El monitoreo detallado de slow queries registra el SQL completo en `monitor.log`. Una consulta puede contener datos de aplicación o literales sensibles, por lo que ese archivo debe tratarse como información protegida y no debe publicarse ni copiarse a ubicaciones de acceso amplio.
+El monitoreo de queries MySQL activas y el análisis detallado de slow queries registran el SQL completo en `monitor.log`. Una consulta puede contener datos de aplicación o literales sensibles, por lo que ese archivo debe tratarse como información protegida y no debe publicarse ni copiarse a ubicaciones de acceso amplio. Pushover recibe una versión limitada por `MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS`.
 
 Si un archivo de configuración con credenciales reales fue compartido fuera del entorno controlado, rote esas credenciales.
