@@ -1262,3 +1262,826 @@ Mantenga al menos:
 El monitoreo de queries MySQL activas y el análisis detallado de slow queries registran el SQL completo en `monitor.log`. Una consulta puede contener datos de aplicación o literales sensibles, por lo que ese archivo debe tratarse como información protegida y no debe publicarse ni copiarse a ubicaciones de acceso amplio. Pushover recibe una versión limitada por `MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS`.
 
 Si un archivo de configuración con credenciales reales fue compartido fuera del entorno controlado, rote esas credenciales.
+
+## 21. Cheat sheet operativo
+
+Comandos de referencia rápida para ejecutar directamente en `df-ec2`. Están pensados para diagnóstico y verificación manual, evitan imprimir secretos y no sustituyen las secciones anteriores.
+
+### Monitor
+
+Ejecutar una revisión completa manual:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --una-vez
+```
+
+Probar Pushover desde el propio monitor:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --probar-alerta
+```
+
+Probar ntfy:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --probar-ntfy
+```
+
+Diagnosticar variables faltantes del `.conf`:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --diagnostico-config
+```
+
+Ver ayuda:
+
+```bash
+sudo /usr/local/sbin/monitor-servidor.sh --ayuda
+```
+
+Validar sintaxis:
+
+```bash
+sudo bash -n /usr/local/sbin/monitor-servidor.sh
+echo "exit=$?"
+```
+
+Ejecutar ShellCheck:
+
+```bash
+sudo shellcheck -s bash -f gcc /usr/local/sbin/monitor-servidor.sh
+echo "exit=$?"
+```
+
+Ver SHA-256 de la versión instalada:
+
+```bash
+sudo sha256sum /usr/local/sbin/monitor-servidor.sh
+```
+
+Contar líneas:
+
+```bash
+sudo wc -l /usr/local/sbin/monitor-servidor.sh
+```
+
+Comprobar que existe la detección de queries activas:
+
+```bash
+sudo grep -n 'monitorear_mysql_queries_activas' \
+  /usr/local/sbin/monitor-servidor.sh
+```
+
+Comprobar las variables nuevas:
+
+```bash
+sudo grep -nE \
+'CHECK_MYSQL_QUERY_ACTIVA_HABILITADO|UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS|UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS|SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA|CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO|REGEX_MYSQL_SLOW_QUERY_SEGURIDAD|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS|SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS' \
+/usr/local/sbin/monitor-servidor.sh
+```
+
+Comprobar las variables explícitas en configuración:
+
+```bash
+sudo grep -E \
+'^(CHECK_MYSQL_QUERY_ACTIVA_HABILITADO|UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS|UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS|SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA|CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO|REGEX_MYSQL_SLOW_QUERY_SEGURIDAD|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS|SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS)=' \
+/etc/monitor-servidor/monitor-servidor.conf
+```
+
+### Logs del monitor
+
+Seguir el log completo:
+
+```bash
+sudo tail -f /var/log/monitor-servidor/monitor.log
+```
+
+Ver ciclos recientes:
+
+```bash
+sudo grep -E \
+'"evento":"monitor".*(inicio_revision|fin_revision)' \
+/var/log/monitor-servidor/monitor.log \
+| tail -50
+```
+
+Ver Pushover:
+
+```bash
+sudo grep '"evento":"pushover"' \
+/var/log/monitor-servidor/monitor.log \
+| tail -50
+```
+
+Seguir queries activas y Pushover en tiempo real:
+
+```bash
+sudo tail -f /var/log/monitor-servidor/monitor.log \
+  | grep --line-buffered -E 'mysql_query_activa|mysql_slow_query|pushover'
+```
+
+Ver últimas queries activas detectadas:
+
+```bash
+sudo grep '"evento":"mysql_query_activa"' \
+/var/log/monitor-servidor/monitor.log \
+| tail -30
+```
+
+Ver slow queries:
+
+```bash
+sudo grep '"evento":"mysql_slow_query"' \
+/var/log/monitor-servidor/monitor.log \
+| tail -30
+```
+
+Ver métricas RDS registradas:
+
+```bash
+sudo grep '"evento":"rds_cloudwatch"' \
+/var/log/monitor-servidor/monitor.log \
+| tail -30
+```
+
+Ver eventos de respaldo:
+
+```bash
+sudo grep '"evento":"respaldo"' \
+/var/log/monitor-servidor/monitor.log \
+| tail -30
+```
+
+Buscar errores y warnings recientes:
+
+```bash
+sudo grep -E '"nivel":"(ERROR|WARN)"' \
+/var/log/monitor-servidor/monitor.log \
+| tail -50
+```
+
+### CRON
+
+Ver CRON de root:
+
+```bash
+sudo crontab -l
+```
+
+Buscar específicamente el monitor:
+
+```bash
+sudo crontab -l | grep monitor-servidor
+```
+
+Comprobar si existe además `/etc/cron.d/monitor-servidor`:
+
+```bash
+sudo cat /etc/cron.d/monitor-servidor
+```
+
+Detectar posibles programaciones duplicadas:
+
+```bash
+sudo grep -R "monitor-servidor.sh" \
+  /etc/cron.d /etc/crontab /var/spool/cron/crontabs 2>/dev/null
+```
+
+Estado de cron:
+
+```bash
+sudo systemctl status cron
+```
+
+### MySQL: conectividad
+
+Prueba mínima:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  -e "SELECT 1;"
+```
+
+Ver usuario efectivo:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  -e "SELECT USER(), CURRENT_USER();"
+```
+
+Ver grants:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  -e "SHOW GRANTS;"
+```
+
+### MySQL: PROCESSLIST
+
+Ver todo lo que el usuario configurado puede observar:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  --batch --skip-column-names \
+  -e "
+SELECT
+    ID,
+    USER,
+    HOST,
+    COALESCE(DB,'-'),
+    COMMAND,
+    TIME,
+    COALESCE(STATE,'-'),
+    LEFT(COALESCE(INFO,''),200)
+FROM information_schema.PROCESSLIST
+WHERE ID <> CONNECTION_ID()
+ORDER BY TIME DESC;
+"
+```
+
+Ver solamente queries realmente activas:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  --batch --skip-column-names \
+  -e "
+SELECT
+    ID,
+    USER,
+    HOST,
+    COALESCE(DB,'-'),
+    COMMAND,
+    TIME,
+    COALESCE(STATE,'-'),
+    LEFT(INFO,500)
+FROM information_schema.PROCESSLIST
+WHERE ID <> CONNECTION_ID()
+  AND COMMAND <> 'Sleep'
+  AND INFO IS NOT NULL
+ORDER BY TIME DESC;
+"
+```
+
+Ver queries activas con más de 60 segundos:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  --batch --skip-column-names \
+  -e "
+SELECT
+    ID,
+    USER,
+    HOST,
+    COALESCE(DB,'-'),
+    TIME,
+    COALESCE(STATE,'-'),
+    LEFT(INFO,500)
+FROM information_schema.PROCESSLIST
+WHERE ID <> CONNECTION_ID()
+  AND COMMAND <> 'Sleep'
+  AND INFO IS NOT NULL
+  AND TIME >= 60
+ORDER BY TIME DESC;
+"
+```
+
+### Prueba controlada de query activa
+
+La prueba que se validó como más fiable para el umbral de `backup_user` (ver sección 15):
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  -e "SELECT SLEEP(200);"
+```
+
+Mientras corre, observar desde otra terminal:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  --batch --skip-column-names \
+  -e "
+SELECT
+    ID,
+    USER,
+    HOST,
+    COMMAND,
+    TIME,
+    STATE,
+    INFO
+FROM information_schema.PROCESSLIST
+WHERE COMMAND <> 'Sleep'
+  AND INFO IS NOT NULL
+  AND ID <> CONNECTION_ID()
+ORDER BY TIME DESC;
+"
+```
+
+Y simultáneamente:
+
+```bash
+sudo tail -f /var/log/monitor-servidor/monitor.log \
+  | grep --line-buffered -E 'mysql_query_activa|pushover'
+```
+
+Para `backup_user`, `SLEEP(200)` es una prueba mucho más fiable que `SLEEP(130)` porque el umbral es de 120 segundos y CRON muestrea cada minuto: `SLEEP(130)` solo deja 10 segundos de margen por encima del umbral.
+
+### Estado MySQL
+
+Ver conexiones, threads, slow queries y uptime:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  -e "
+SHOW GLOBAL STATUS
+WHERE Variable_name IN (
+    'Threads_connected',
+    'Threads_running',
+    'Slow_queries',
+    'Uptime'
+);
+"
+```
+
+Ver configuración relevante:
+
+```bash
+sudo mysql \
+  --defaults-extra-file=/etc/monitor-servidor/mysql.cnf \
+  -e "
+SHOW GLOBAL VARIABLES
+WHERE Variable_name IN (
+    'max_connections',
+    'long_query_time',
+    'slow_query_log',
+    'log_output',
+    'general_log'
+);
+"
+```
+
+### AWS: identidad y configuración
+
+Ver identidad AWS efectiva:
+
+```bash
+sudo -H aws sts get-caller-identity \
+  --profile agente-control-monitoring \
+  --region us-east-2
+```
+
+Ver versión AWS CLI:
+
+```bash
+sudo -H aws --version
+```
+
+### AWS RDS
+
+Estado general de la instancia:
+
+```bash
+sudo -H aws rds describe-db-instances \
+  --db-instance-identifier df-instancia-01 \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --query 'DBInstances[0].[DBInstanceIdentifier,DBInstanceClass,DBInstanceStatus,Engine,EngineVersion,Endpoint.Address]' \
+  --output table
+```
+
+Ver solo la clase:
+
+```bash
+sudo -H aws rds describe-db-instances \
+  --db-instance-identifier df-instancia-01 \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --query 'DBInstances[0].DBInstanceClass' \
+  --output text
+```
+
+Ver exportaciones de logs habilitadas:
+
+```bash
+sudo -H aws rds describe-db-instances \
+  --db-instance-identifier df-instancia-01 \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --query 'DBInstances[0].EnabledCloudwatchLogsExports' \
+  --output table
+```
+
+### CloudWatch: CPU de RDS
+
+Última hora:
+
+```bash
+sudo -H aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name CPUUtilization \
+  --dimensions Name=DBInstanceIdentifier,Value=df-instancia-01 \
+  --start-time "$(date -u -d '1 hour ago' '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 300 \
+  --statistics Average Maximum \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output table
+```
+
+Últimas 24 horas:
+
+```bash
+sudo -H aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name CPUUtilization \
+  --dimensions Name=DBInstanceIdentifier,Value=df-instancia-01 \
+  --start-time "$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 300 \
+  --statistics Average Maximum \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output table
+```
+
+### CloudWatch: CPUCreditBalance
+
+```bash
+sudo -H aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name CPUCreditBalance \
+  --dimensions Name=DBInstanceIdentifier,Value=df-instancia-01 \
+  --start-time "$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 300 \
+  --statistics Average Minimum Maximum \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output table
+```
+
+Ver solamente el punto más reciente:
+
+```bash
+sudo -H aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name CPUCreditBalance \
+  --dimensions Name=DBInstanceIdentifier,Value=df-instancia-01 \
+  --start-time "$(date -u -d '30 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 300 \
+  --statistics Average \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --query 'Datapoints | sort_by(@,&Timestamp)[-1]' \
+  --output table
+```
+
+### CloudWatch: memoria RDS
+
+```bash
+sudo -H aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name FreeableMemory \
+  --dimensions Name=DBInstanceIdentifier,Value=df-instancia-01 \
+  --start-time "$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 300 \
+  --statistics Average Minimum Maximum \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output table
+```
+
+### CloudWatch: conexiones RDS
+
+```bash
+sudo -H aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name DatabaseConnections \
+  --dimensions Name=DBInstanceIdentifier,Value=df-instancia-01 \
+  --start-time "$(date -u -d '6 hours ago' '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 300 \
+  --statistics Average Maximum \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output table
+```
+
+### Slow Query Log en CloudWatch
+
+Ver eventos recientes:
+
+```bash
+sudo -H aws logs filter-log-events \
+  --log-group-name "/aws/rds/instance/df-instancia-01/slowquery" \
+  --limit 20 \
+  --profile agente-control-monitoring \
+  --region us-east-2
+```
+
+Buscar `SLEEP`:
+
+```bash
+sudo -H aws logs filter-log-events \
+  --log-group-name "/aws/rds/instance/df-instancia-01/slowquery" \
+  --filter-pattern "SLEEP" \
+  --limit 50 \
+  --profile agente-control-monitoring \
+  --region us-east-2
+```
+
+Buscar `BENCHMARK`:
+
+```bash
+sudo -H aws logs filter-log-events \
+  --log-group-name "/aws/rds/instance/df-instancia-01/slowquery" \
+  --filter-pattern "BENCHMARK" \
+  --limit 50 \
+  --profile agente-control-monitoring \
+  --region us-east-2
+```
+
+### EC2 en AWS
+
+Estado AWS de la instancia:
+
+```bash
+sudo -H aws ec2 describe-instance-status \
+  --include-all-instances \
+  --instance-ids i-0502108d733ea74c3 \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output table
+```
+
+### Apache
+
+Estado:
+
+```bash
+sudo systemctl status apache2
+```
+
+Configuración:
+
+```bash
+sudo apache2ctl configtest
+```
+
+Server-status:
+
+```bash
+curl -s 'http://127.0.0.1/server-status?auto'
+```
+
+Workers relevantes:
+
+```bash
+curl -s 'http://127.0.0.1/server-status?auto' \
+  | grep -E 'BusyWorkers|IdleWorkers|ReqPerSec|CPULoad'
+```
+
+Procesos Apache:
+
+```bash
+ps -eo pid,ppid,user,%cpu,%mem,etime,cmd \
+  | grep '[a]pache2'
+```
+
+Conexiones HTTP/HTTPS establecidas:
+
+```bash
+sudo ss -Htan state established \
+  '( sport = :80 or sport = :443 )'
+```
+
+Contarlas:
+
+```bash
+sudo ss -Htan state established \
+  '( sport = :80 or sport = :443 )' \
+  | wc -l
+```
+
+### Logs Apache por sitio
+
+Sustituya `<vhost>` por el nombre real del VirtualHost (por ejemplo `vitaticket` o `vitacuracorporacioncultural`) y `<ruta>` por la ruta de la aplicación a inspeccionar.
+
+Últimas peticiones a una ruta concreta:
+
+```bash
+sudo grep '<ruta>' \
+  /var/log/apache2/<vhost>.cl-access.log \
+  | tail -100
+```
+
+Solo POST:
+
+```bash
+sudo grep '"POST <ruta>' \
+  /var/log/apache2/<vhost>.cl-access.log \
+  | tail -100
+```
+
+Contar IPs que hicieron POST a esa ruta:
+
+```bash
+sudo grep '"POST <ruta>' \
+  /var/log/apache2/<vhost>.cl-access.log \
+  | awk '{print $1}' \
+  | sort \
+  | uniq -c \
+  | sort -nr \
+  | head -30
+```
+
+Buscar errores PHP recientes:
+
+```bash
+sudo grep -Ei \
+'PHP (Fatal|Parse|Recoverable)|Uncaught (Error|Exception)' \
+/var/log/apache2/<vhost>.cl-error.log \
+| tail -100
+```
+
+### Búsqueda de código PHP ante sospecha de SQL injection
+
+Patrón genérico para localizar concatenaciones de variables HTTP en el código de la aplicación afectada. Sustituya `<ruta-aplicacion>` por la ruta real del código a revisar y `<campo1>|<campo2>|...` por los nombres de columnas/parámetros involucrados en el incidente concreto.
+
+Buscar concatenaciones relevantes:
+
+```bash
+grep -RIn \
+  -E '<campo1>|<campo2>|<campo3>' \
+  <ruta-aplicacion>/
+```
+
+Buscar uso directo de variables HTTP sin sanitizar:
+
+```bash
+grep -RIn \
+  -E '\$_(GET|POST|REQUEST)' \
+  <ruta-aplicacion>/
+```
+
+No documente aquí rutas ni nombres de campos de incidentes reales; regístrelos en el sistema de seguimiento de incidentes correspondiente, no en este README.
+
+### Pushover
+
+Validar usuario/dispositivo sin mostrar las credenciales:
+
+```bash
+sudo bash -c '
+source /etc/monitor-servidor/monitor-servidor.conf
+
+curl --silent --show-error --fail \
+  --data-urlencode "token=${API_TOKEN}" \
+  --data-urlencode "user=${USER_KEY}" \
+  https://api.pushover.net/1/users/validate.json
+
+echo
+'
+```
+
+Enviar prueba directa:
+
+```bash
+sudo bash -c '
+source /etc/monitor-servidor/monitor-servidor.conf
+
+curl --silent --show-error --fail \
+  --request POST \
+  --data-urlencode "token=${API_TOKEN}" \
+  --data-urlencode "user=${USER_KEY}" \
+  --data-urlencode "title=PRUEBA DIRECTA df-ec2" \
+  --data-urlencode "message=Prueba directa desde df-ec2" \
+  --data-urlencode "priority=1" \
+  https://api.pushover.net/1/messages.json
+
+echo
+'
+```
+
+### Backup
+
+Ver estado actual:
+
+```bash
+sudo cat /home/aalcafuz/zrespaldos/logs/ultimo_backup.estado
+```
+
+Log reciente:
+
+```bash
+sudo tail -100 /home/aalcafuz/zrespaldos/logs/backup_s3.log
+```
+
+Ver procesos relacionados con backup:
+
+```bash
+ps -ef \
+  | grep -E '[z]_crea_respaldo|[m]ysqldump|[t]ar|[a]ws s3'
+```
+
+### Sistema
+
+CPU y carga:
+
+```bash
+uptime
+```
+
+```bash
+top
+```
+
+Memoria:
+
+```bash
+free -h
+```
+
+Discos:
+
+```bash
+df -h
+```
+
+Inodos:
+
+```bash
+df -ih
+```
+
+Procesos por CPU:
+
+```bash
+ps -eo pid,user,%cpu,%mem,etime,cmd \
+  --sort=-%cpu \
+  | head -30
+```
+
+Procesos por RAM:
+
+```bash
+ps -eo pid,user,%cpu,%mem,etime,cmd \
+  --sort=-%mem \
+  | head -30
+```
+
+### Comparación antes de desplegar
+
+Sintaxis:
+
+```bash
+bash -n monitor-servidor.sh
+```
+
+ShellCheck:
+
+```bash
+shellcheck -s bash -f gcc monitor-servidor.sh
+```
+
+Diff contra la copia previa:
+
+```bash
+diff -u \
+  monitor-servidor-anterior.sh \
+  monitor-servidor.sh
+```
+
+Hashes:
+
+```bash
+sha256sum \
+  monitor-servidor-anterior.sh \
+  monitor-servidor.sh
+```
+
+Líneas:
+
+```bash
+wc -l \
+  monitor-servidor-anterior.sh \
+  monitor-servidor.sh
+```
+
+Comparar repositorio local contra producción sin modificar nada:
+
+```bash
+sudo diff -u \
+  /usr/local/sbin/monitor-servidor.sh \
+  ./monitor-servidor.sh
+```
