@@ -280,18 +280,22 @@ UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS=120
 # SQL máximo incluido en Pushover. El SQL completo permanece en monitor.log.
 MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS=700
 
-> # Queries MySQL actualmente en ejecución.
-> CHECK_MYSQL_QUERY_ACTIVA_HABILITADO=1
-> UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS=60
-> UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS=300
-> SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA=3600
-> 
-> # SQL potencialmente malicioso detectado en el Slow Query Log.
-> CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO=1
-> REGEX_MYSQL_SLOW_QUERY_SEGURIDAD='SLEEP[[:space:]]*\(|BENCHMARK[[:space:]]*\('
-> 
-> # Ventana retrospectiva de CloudWatch para absorber eventos tardíos.
-> MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS=86400
+# Queries MySQL actualmente en ejecución.
+CHECK_MYSQL_QUERY_ACTIVA_HABILITADO=1
+UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS=60
+UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS=300
+SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA=3600
+
+# SQL potencialmente malicioso detectado en el Slow Query Log.
+CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO=1
+REGEX_MYSQL_SLOW_QUERY_SEGURIDAD='SLEEP[[:space:]]*\(|BENCHMARK[[:space:]]*\('
+
+# Ventana retrospectiva de CloudWatch para absorber eventos tardíos.
+MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS=86400
+
+# CPUCreditBalance: repetición independiente de una condición persistente.
+# 21600 segundos = 6 horas. La primera alerta sigue usando TIEMPO_SOSTENIDO_RDS.
+SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS=21600
 
 ###############################################################################
 # AWS CLI / CloudWatch
