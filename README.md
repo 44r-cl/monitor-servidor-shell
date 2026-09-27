@@ -851,7 +851,10 @@ Los thresholds se definen en `monitor-servidor.conf`.
 
 ```bash
 UMBRAL_RDS_CPU_CREDIT_BALANCE=50
+SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS=21600
 ```
+
+La primera alerta continúa respetando `TIEMPO_SOSTENIDO_RDS`. Si el saldo permanece bajo, `SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS=21600` limita las repeticiones de esta condición a una cada 6 horas, en lugar de usar el cooldown global de 30 minutos. La recuperación sigue notificándose cuando el saldo vuelve a un nivel normal.
 
 Para la familia T3, un cambio entre `db.t3.medium` y `db.t3.small` no requiere por sí solo modificar este umbral: ambas clases utilizan 2 vCPU, obtienen 24 créditos de CPU por hora y tienen una utilización base de 20% por vCPU. Por ello se mantiene inicialmente el valor `50` y se recomienda evaluar la tendencia del saldo después del cambio de clase.
 
@@ -902,6 +905,14 @@ SEGUNDOS_COOLDOWN_ALERTA=1800
 ```
 
 por lo que una condición todavía activa no debe bombardear Pushover cada minuto.
+
+`CPUCreditBalance` de RDS utiliza un cooldown independiente:
+
+```bash
+SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS=21600
+```
+
+Con la configuración actual, una condición persistente de créditos CPU bajos puede repetirse como máximo cada 6 horas. Este cooldown no altera la primera alerta ni la notificación de recuperación, y no modifica el comportamiento de las demás alertas que continúan usando `SEGUNDOS_COOLDOWN_ALERTA`.
 
 Para errores Apache, las ocurrencias se acumulan por sitio y categoría. La alerta requiere que en la ejecución actual exista al menos una ocurrencia nueva y que el acumulado haya alcanzado el threshold.
 
