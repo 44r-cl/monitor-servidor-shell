@@ -235,6 +235,15 @@ UMBRAL_RDS_BURST_BALANCE_PCT="${UMBRAL_RDS_BURST_BALANCE_PCT:-20}"
 UMBRAL_RDS_CONEXIONES="${UMBRAL_RDS_CONEXIONES:-0}"
 TIEMPO_SOSTENIDO_RDS="${TIEMPO_SOSTENIDO_RDS:-300}"
 
+# Volumen del general query log de RDS exportado a CloudWatch Logs (métrica
+# IncomingBytes). Permite detectar un crecimiento anómalo -por ejemplo, un
+# escaneo o ataque generando muchas consultas- antes de que el volumen/costo
+# se salga de control. Log group vacío deshabilita el chequeo. Umbral en 0
+# deja el chequeo en modo observación: registra el volumen en monitor.log sin
+# alertar, hasta fijar un umbral con datos reales de tráfico normal.
+RDS_LOG_GENERAL_LOG_GROUP="${RDS_LOG_GENERAL_LOG_GROUP:-}"
+UMBRAL_RDS_LOG_GENERAL_MB="${UMBRAL_RDS_LOG_GENERAL_MB:-0}"
+
 # Verificación puntual de cambio de horario (DST). Confirma, una sola vez por
 # FECHA_CAMBIO_HORARIO configurada, que sistema operativo, PHP (vía Apache) y
 # MySQL reflejen el nuevo offset UTC. Se auto-desactiva marcando esa fecha
@@ -333,7 +342,7 @@ categoria_de_variable() {
             printf 'Certificados TLS' ;;
         MYSQL_CNF|MYSQL_TIMEOUT|MYSQL_INTENTOS|UMBRAL_MYSQL_CONEXIONES_PCT|UMBRAL_MYSQL_THREADS_RUNNING|TIEMPO_SOSTENIDO_MYSQL|UMBRAL_MYSQL_SLOW_POR_MINUTO|CHECK_MYSQL_QUERY_ACTIVA_HABILITADO|UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS|UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS|SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA|CHECK_MYSQL_SLOW_QUERY_DETAILS|MYSQL_SLOW_QUERY_LOG_GROUP|UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES|VENTANA_MYSQL_SLOW_QUERY_REPETICIONES|SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY|MYSQL_SLOW_QUERY_USUARIOS_BACKUP|UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS|MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS|CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO|REGEX_MYSQL_SLOW_QUERY_SEGURIDAD|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS)
             printf 'MySQL / RDS' ;;
-        AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_STORAGE_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS)
+        AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_STORAGE_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS|RDS_LOG_GENERAL_LOG_GROUP|UMBRAL_RDS_LOG_GENERAL_MB)
             printf 'AWS CLI / CloudWatch' ;;
         CHECK_CAMBIO_HORARIO_HABILITADO|FECHA_CAMBIO_HORARIO|OFFSET_ANTES_CAMBIO_HORARIO|OFFSET_CAMBIO_HORARIO_ESPERADO|CAMBIO_HORARIO_PHP_URL|VENTANA_CAMBIO_HORARIO_SEGUNDOS)
             printf 'Cambio de horario (DST)' ;;
@@ -2727,6 +2736,54 @@ obtener_metrica_rds() {
     return 1
 }
 
+# Igual que obtener_metrica_rds() pero para métricas del namespace AWS/Logs
+# (CloudWatch Logs), dimensionadas por nombre de log group en vez de por
+# instancia RDS.
+#
+# Argumentos:
+#   1: nombre de la métrica (ej. IncomingBytes).
+#   2: nombre completo del log group.
+#   3: estadística (Sum, Average, etc.). Default: Sum.
+#   4: período en segundos. Default: 60.
+#   5: minutos hacia atrás para la ventana de búsqueda. Default: 10.
+obtener_metrica_logs_aws() {
+    local metrica="$1"
+    local grupo_log="$2"
+    local estadistica="${3:-Sum}"
+    local periodo="${4:-60}"
+    local minutos_atras="${5:-10}"
+    local ahora inicio intento
+
+    ahora="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    inicio="$(date -u -d "${minutos_atras} minutes ago" '+%Y-%m-%dT%H:%M:%SZ')"
+
+    for ((intento = 1; intento <= AWS_INTENTOS; intento++)); do
+        if ejecutar_aws cloudwatch get-metric-statistics \
+            --namespace AWS/Logs \
+            --metric-name "$metrica" \
+            --dimensions "Name=LogGroupName,Value=${grupo_log}" \
+            --start-time "$inicio" \
+            --end-time "$ahora" \
+            --period "$periodo" \
+            --statistics "$estadistica" \
+            --query "Datapoints | sort_by(@,&Timestamp)[-1].${estadistica}" \
+            --output text; then
+            if es_numero "$AWS_SALIDA_COMANDO"; then
+                printf '%s\n' "$AWS_SALIDA_COMANDO"
+                return 0
+            fi
+        else
+            registrar "WARN" "aws" "operacion=GetMetricStatistics namespace=AWS/Logs metrica=${metrica} log_group=${grupo_log} intento=${intento}/${AWS_INTENTOS} error=${AWS_ERROR_COMANDO:-desconocido}"
+        fi
+
+        if (( intento < AWS_INTENTOS )); then
+            sleep "$SEGUNDOS_ENTRE_REINTENTOS"
+        fi
+    done
+
+    return 1
+}
+
 monitorear_aws() {
     local estado_rds="" estado_ec2=""
     local rds_cpu="" rds_memoria_bytes="" rds_memoria_mb="" rds_conexiones=""
@@ -2736,6 +2793,8 @@ monitorear_aws() {
     local condicion_estado_rds=0 condicion_rds_cpu=0 condicion_rds_memoria=0 condicion_rds_storage=0 condicion_rds_conexiones=0
     local condicion_rds_swap=0 condicion_rds_creditos_cpu=0 condicion_rds_burst=0
     local condicion_estado_ec2=0
+    local rds_log_general_bytes="" rds_log_general_mb="" rds_log_general_mb_log
+    local condicion_rds_log_general=0
 
     if [[ "$AWS_CLI_HABILITADO" != "1" ]]; then
         return 0
@@ -2941,6 +3000,40 @@ monitorear_aws() {
                     "DatabaseConnections de RDS ${RDS_DB_INSTANCE_ID} volvió a nivel normal: ${rds_conexiones}."
             else
                 registrar "WARN" "rds_cloudwatch" "Sin dato válido para DatabaseConnections de ${RDS_DB_INSTANCE_ID}."
+            fi
+        fi
+    fi
+
+    if [[ -n "$RDS_LOG_GENERAL_LOG_GROUP" ]]; then
+        # IncomingBytes por minuto del general query log exportado a
+        # CloudWatch. Umbral en 0 deja este chequeo en modo observación:
+        # registra el volumen en monitor.log sin alertar, hasta fijar un
+        # umbral con datos reales de tráfico normal.
+        rds_log_general_bytes="$(obtener_metrica_logs_aws IncomingBytes "$RDS_LOG_GENERAL_LOG_GROUP" Sum 60 10 || true)"
+
+        if es_numero "$rds_log_general_bytes"; then
+            rds_log_general_mb="$(awk -v bytes="$rds_log_general_bytes" 'BEGIN {printf "%.2f", bytes/1024/1024}')"
+        fi
+
+        rds_log_general_mb_log="$(formatear_decimal_log "${rds_log_general_mb:-NA}")"
+        registrar "INFO" "rds_log_general" "log_group=${RDS_LOG_GENERAL_LOG_GROUP} volumen_mb_ultimo_minuto=${rds_log_general_mb_log}"
+
+        if mayor_igual "$UMBRAL_RDS_LOG_GENERAL_MB" "0.01"; then
+            if es_numero "$rds_log_general_mb"; then
+                if mayor_igual "$rds_log_general_mb" "$UMBRAL_RDS_LOG_GENERAL_MB"; then
+                    condicion_rds_log_general=1
+                fi
+
+                gestionar_alerta \
+                    "rds_log_general_volumen" \
+                    "$condicion_rds_log_general" \
+                    "$TIEMPO_SOSTENIDO_RDS" \
+                    "Volumen alto en general log RDS - ${NOMBRE_SERVIDOR}" \
+                    "RDS: el general log (${RDS_LOG_GENERAL_LOG_GROUP}) ingirió ${rds_log_general_mb} MB en el último minuto, umbral ${UMBRAL_RDS_LOG_GENERAL_MB} MB." \
+                    1 \
+                    "El volumen del general log de RDS volvió a nivel normal: ${rds_log_general_mb} MB."
+            else
+                registrar "WARN" "rds_log_general" "Sin dato válido para IncomingBytes de ${RDS_LOG_GENERAL_LOG_GROUP}."
             fi
         fi
     fi
