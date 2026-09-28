@@ -346,6 +346,16 @@ UMBRAL_RDS_CONEXIONES=0
 # Duración mínima de la anomalía antes de alertar.
 TIEMPO_SOSTENIDO_RDS=300
 
+# Volumen del general query log de RDS exportado a CloudWatch Logs (métrica
+# IncomingBytes). Log group vacío deshabilita el chequeo.
+RDS_LOG_GENERAL_LOG_GROUP="/aws/rds/instance/df-instancia-01/general"
+
+# Umbral en MB ingeridos por minuto. 0 = modo observación: solo registra el
+# volumen en monitor.log (evento rds_log_general) sin alertar. El general log
+# se activó recién el 2026-09-28; una vez que haya unos días de datos reales
+# de tráfico normal, fije aquí un umbral acorde y deje de estar en 0.
+UMBRAL_RDS_LOG_GENERAL_MB=0
+
 ###############################################################################
 # Verificación puntual de cambio de horario (DST)
 ###############################################################################
