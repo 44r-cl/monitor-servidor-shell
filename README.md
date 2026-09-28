@@ -868,6 +868,19 @@ En instancias T3 también resulta útil observar `CPUSurplusCreditBalance` y `CP
 
 `BurstBalance` es relevante para almacenamiento que expone créditos de I/O, como gp2.
 
+### Volumen del general query log
+
+Si `RDS_LOG_GENERAL_LOG_GROUP` apunta a un log group de CloudWatch (el general query log de RDS exportado, por ejemplo `/aws/rds/instance/df-instancia-01/general`), el monitor consulta cada minuto la métrica `IncomingBytes` del namespace `AWS/Logs` para ese log group (suma del último minuto) y registra el resultado en `monitor.log` con el evento `rds_log_general`, campo `volumen_mb_ultimo_minuto`.
+
+```bash
+RDS_LOG_GENERAL_LOG_GROUP="/aws/rds/instance/df-instancia-01/general"
+UMBRAL_RDS_LOG_GENERAL_MB=0
+```
+
+`UMBRAL_RDS_LOG_GENERAL_MB=0` deja el chequeo en **modo observación**: se registra el volumen pero no se envía ninguna alerta. Esto es intencional mientras no exista una línea base de tráfico normal para este log group. Una vez que haya datos reales acumulados (revisando el evento `rds_log_general` en el log), se puede fijar un umbral distinto de `0` para que empiece a alertar con `TIEMPO_SOSTENIDO_RDS` de persistencia y el cooldown global (`SEGUNDOS_COOLDOWN_ALERTA`), igual que el resto de las métricas de esta sección.
+
+El general query log registra *toda* consulta, no solo las lentas, así que su volumen normal puede ser considerablemente mayor que el de `slowquery`. Un crecimiento repentino puede indicar tanto un problema de aplicación (bucle generando consultas) como actividad de reconocimiento/ataque (por ejemplo, un escaneo automatizado de inyección SQL). Este chequeo es un complemento a la detección de queries activas y slow queries, no un reemplazo.
+
 ---
 
 ## 14. Pushover
