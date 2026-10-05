@@ -356,6 +356,28 @@ RDS_LOG_GENERAL_LOG_GROUP="/aws/rds/instance/df-instancia-01/general"
 # de tráfico normal, fije aquí un umbral acorde y deje de estar en 0.
 UMBRAL_RDS_LOG_GENERAL_MB=0
 
+# Free Tier de CloudWatch Logs: ingestión acumulada de TODOS los log groups de
+# la cuenta/región (no solo los de RDS), comparada contra el límite gratuito
+# mensual de AWS. Distinto de UMBRAL_RDS_LOG_GENERAL_MB: ese vigila un log
+# group puntual minuto a minuto para detectar anomalías; este vigila el total
+# de la cuenta acumulado en el mes -la base real sobre la que AWS factura una
+# vez agotado el Free Tier.
+CHECK_CLOUDWATCH_FREE_TIER_HABILITADO=1
+
+# Límite gratuito mensual de ingestión de CloudWatch Logs, en GB. AWS lo fija
+# hoy en 5 GB ("Always Free"); ajuste este valor si AWS lo cambia o si prefiere
+# un techo propio más conservador.
+UMBRAL_CLOUDWATCH_FREE_TIER_GB=5
+
+# Superado el Free Tier, vuelve a avisar cada vez que el consumo del mes sube
+# esta cantidad adicional en GB (ej. límite + 3, límite + 6, ...).
+UMBRAL_CLOUDWATCH_INCREMENTO_GB=3
+
+# Frecuencia mínima entre chequeos, en segundos. La consulta recorre todos los
+# log groups de la cuenta, así que no tiene sentido repetirla cada minuto.
+# 21600 segundos = 6 horas.
+SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER=21600
+
 ###############################################################################
 # Verificación puntual de cambio de horario (DST)
 ###############################################################################
