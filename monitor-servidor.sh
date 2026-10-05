@@ -244,6 +244,17 @@ TIEMPO_SOSTENIDO_RDS="${TIEMPO_SOSTENIDO_RDS:-300}"
 RDS_LOG_GENERAL_LOG_GROUP="${RDS_LOG_GENERAL_LOG_GROUP:-}"
 UMBRAL_RDS_LOG_GENERAL_MB="${UMBRAL_RDS_LOG_GENERAL_MB:-0}"
 
+# Free Tier de CloudWatch Logs: ingestión acumulada de TODOS los log groups de
+# la cuenta/región (no solo los de RDS), comparada contra el límite gratuito
+# mensual de AWS. A diferencia de UMBRAL_RDS_LOG_GENERAL_MB (que vigila un log
+# group puntual minuto a minuto para detectar anomalías), este chequeo vigila
+# el total de la cuenta acumulado en el mes -la base real sobre la que AWS
+# factura una vez agotado el Free Tier- y envía un resumen al cerrar cada mes.
+CHECK_CLOUDWATCH_FREE_TIER_HABILITADO="${CHECK_CLOUDWATCH_FREE_TIER_HABILITADO:-0}"
+UMBRAL_CLOUDWATCH_FREE_TIER_GB="${UMBRAL_CLOUDWATCH_FREE_TIER_GB:-5}"
+UMBRAL_CLOUDWATCH_INCREMENTO_GB="${UMBRAL_CLOUDWATCH_INCREMENTO_GB:-3}"
+SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER="${SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER:-21600}"
+
 # Verificación puntual de cambio de horario (DST). Confirma, una sola vez por
 # FECHA_CAMBIO_HORARIO configurada, que sistema operativo, PHP (vía Apache) y
 # MySQL reflejen el nuevo offset UTC. Se auto-desactiva marcando esa fecha
@@ -342,7 +353,7 @@ categoria_de_variable() {
             printf 'Certificados TLS' ;;
         MYSQL_CNF|MYSQL_TIMEOUT|MYSQL_INTENTOS|UMBRAL_MYSQL_CONEXIONES_PCT|UMBRAL_MYSQL_THREADS_RUNNING|TIEMPO_SOSTENIDO_MYSQL|UMBRAL_MYSQL_SLOW_POR_MINUTO|CHECK_MYSQL_QUERY_ACTIVA_HABILITADO|UMBRAL_MYSQL_QUERY_ACTIVA_SEGUNDOS|UMBRAL_MYSQL_QUERY_ACTIVA_CRITICA_SEGUNDOS|SEGUNDOS_COOLDOWN_MYSQL_QUERY_ACTIVA|CHECK_MYSQL_SLOW_QUERY_DETAILS|MYSQL_SLOW_QUERY_LOG_GROUP|UMBRAL_MYSQL_SLOW_QUERY_REPETICION_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_ALERTA_SEGUNDOS|UMBRAL_MYSQL_SLOW_QUERY_REPETICIONES|VENTANA_MYSQL_SLOW_QUERY_REPETICIONES|SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY|MYSQL_SLOW_QUERY_USUARIOS_BACKUP|UMBRAL_MYSQL_SLOW_QUERY_BACKUP_SEGUNDOS|MYSQL_SLOW_QUERY_SQL_PUSHOVER_MAX_CHARS|CHECK_MYSQL_SLOW_QUERY_SEGURIDAD_HABILITADO|REGEX_MYSQL_SLOW_QUERY_SEGURIDAD|MYSQL_SLOW_QUERY_SOLAPAMIENTO_SEGUNDOS)
             printf 'MySQL / RDS' ;;
-        AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_STORAGE_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS|RDS_LOG_GENERAL_LOG_GROUP|UMBRAL_RDS_LOG_GENERAL_MB)
+        AWS_CLI_HABILITADO|AWS_PROFILE|AWS_REGION|RDS_DB_INSTANCE_ID|EC2_INSTANCE_ID|AWS_INTENTOS|UMBRAL_RDS_CPU_PCT|UMBRAL_RDS_MEMORIA_LIBRE_MB|UMBRAL_RDS_STORAGE_LIBRE_MB|UMBRAL_RDS_SWAP_MB|UMBRAL_RDS_CPU_CREDIT_BALANCE|SEGUNDOS_COOLDOWN_RDS_CPU_CREDITOS|UMBRAL_RDS_BURST_BALANCE_PCT|UMBRAL_RDS_CONEXIONES|TIEMPO_SOSTENIDO_RDS|RDS_LOG_GENERAL_LOG_GROUP|UMBRAL_RDS_LOG_GENERAL_MB|CHECK_CLOUDWATCH_FREE_TIER_HABILITADO|UMBRAL_CLOUDWATCH_FREE_TIER_GB|UMBRAL_CLOUDWATCH_INCREMENTO_GB|SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER)
             printf 'AWS CLI / CloudWatch' ;;
         CHECK_CAMBIO_HORARIO_HABILITADO|FECHA_CAMBIO_HORARIO|OFFSET_ANTES_CAMBIO_HORARIO|OFFSET_CAMBIO_HORARIO_ESPERADO|CAMBIO_HORARIO_PHP_URL|VENTANA_CAMBIO_HORARIO_SEGUNDOS)
             printf 'Cambio de horario (DST)' ;;
@@ -2784,6 +2795,153 @@ obtener_metrica_logs_aws() {
     return 1
 }
 
+# Suma IncomingBytes (namespace AWS/Logs) de TODOS los log groups de la cuenta
+# en el rango de fechas indicado y la devuelve en GB. El Free Tier de
+# CloudWatch Logs se calcula sobre la ingestión total de la cuenta/región, no
+# por log group individual, así que no basta con mirar solo los de RDS.
+#
+# Argumentos:
+#   1: inicio (ISO 8601 UTC, ej. 2026-10-01T00:00:00Z).
+#   2: fin (ISO 8601 UTC).
+obtener_cloudwatch_logs_ingestion_gb() {
+    local inicio="$1"
+    local fin="$2"
+    local grupos grupo bytes_grupo total_bytes=0
+
+    if ! ejecutar_aws logs describe-log-groups \
+        --query 'logGroups[].logGroupName' \
+        --output text; then
+        registrar "WARN" "cloudwatch_free_tier" "operacion=DescribeLogGroups error=${AWS_ERROR_COMANDO:-desconocido}"
+        return 1
+    fi
+    grupos="$AWS_SALIDA_COMANDO"
+
+    if [[ -z "$grupos" ]]; then
+        printf '0.00\n'
+        return 0
+    fi
+
+    while IFS=$'\t' read -r -a fila; do
+        for grupo in "${fila[@]}"; do
+            [[ -n "$grupo" ]] || continue
+
+            if ejecutar_aws cloudwatch get-metric-statistics \
+                --namespace AWS/Logs \
+                --metric-name IncomingBytes \
+                --dimensions "Name=LogGroupName,Value=${grupo}" \
+                --start-time "$inicio" \
+                --end-time "$fin" \
+                --period 3600 \
+                --statistics Sum \
+                --query 'sum(Datapoints[].Sum)' \
+                --output text; then
+                bytes_grupo="$AWS_SALIDA_COMANDO"
+                if es_numero "$bytes_grupo"; then
+                    total_bytes="$(awk -v t="$total_bytes" -v b="$bytes_grupo" 'BEGIN { printf "%.0f", t + b }')"
+                fi
+            else
+                registrar "WARN" "cloudwatch_free_tier" "operacion=GetMetricStatistics log_group=${grupo} error=${AWS_ERROR_COMANDO:-desconocido}"
+            fi
+        done
+    done <<< "$grupos"
+
+    awk -v bytes="$total_bytes" 'BEGIN { printf "%.2f", bytes / 1024 / 1024 / 1024 }'
+}
+
+# Vigila el consumo mensual del Free Tier de CloudWatch Logs (5 GB/mes de
+# ingestión, "Always Free"), a diferencia de UMBRAL_RDS_LOG_GENERAL_MB que
+# vigila un log group puntual minuto a minuto para detectar anomalías. Este
+# chequeo recorre todos los log groups de la cuenta, por lo que se limita a
+# ejecutarse como mucho cada SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER.
+#
+# Comportamiento:
+#   - Avisa UNA sola vez al cruzar UMBRAL_CLOUDWATCH_FREE_TIER_GB.
+#   - Superado ese umbral, avisa cada vez que el consumo sube
+#     UMBRAL_CLOUDWATCH_INCREMENTO_GB adicionales (si el salto entre dos
+#     chequeos cruza más de un escalón, avisa una vez por cada uno).
+#   - Al detectar que cambió el mes calendario (UTC), envía un resumen con el
+#     total GB del mes recién cerrado y reinicia el nivel de alerta.
+monitorear_cloudwatch_free_tier() {
+    local archivo_estado="${DIRECTORIO_ESTADO}/cloudwatch_free_tier.estado"
+    local ahora mes_actual mes_guardado="" ultima_verificacion=0 nivel_alertado_gb=0
+    local inicio_rango fin_rango gb_mes_anterior gb_actual siguiente_umbral
+
+    if ! booleano_habilitado "$CHECK_CLOUDWATCH_FREE_TIER_HABILITADO"; then
+        return 0
+    fi
+
+    ahora="$(date +%s)"
+    mes_actual="$(date -u +%Y-%m)"
+
+    if [[ -r "$archivo_estado" ]]; then
+        IFS='|' read -r ultima_verificacion mes_guardado nivel_alertado_gb < "$archivo_estado" || true
+        ultima_verificacion="${ultima_verificacion:-0}"
+        nivel_alertado_gb="${nivel_alertado_gb:-0}"
+    fi
+
+    if [[ -n "$mes_guardado" && "$mes_guardado" != "$mes_actual" ]]; then
+        inicio_rango="${mes_guardado}-01T00:00:00Z"
+        fin_rango="${mes_actual}-01T00:00:00Z"
+
+        if gb_mes_anterior="$(obtener_cloudwatch_logs_ingestion_gb "$inicio_rango" "$fin_rango")"; then
+            registrar "INFO" "cloudwatch_free_tier" "resumen_mes=${mes_guardado} ingestion_total_gb=${gb_mes_anterior} limite_free_tier_gb=${UMBRAL_CLOUDWATCH_FREE_TIER_GB}"
+            enviar_notificacion \
+                "Resumen CloudWatch Logs ${mes_guardado} - ${NOMBRE_SERVIDOR}" \
+                "Ingestión total de CloudWatch Logs en ${mes_guardado}: ${gb_mes_anterior} GB (Free Tier: ${UMBRAL_CLOUDWATCH_FREE_TIER_GB} GB)." \
+                0 || true
+        else
+            registrar "WARN" "cloudwatch_free_tier" "resumen_mes=${mes_guardado} error=no_se_pudo_calcular"
+        fi
+
+        nivel_alertado_gb=0
+    fi
+
+    mes_guardado="$mes_actual"
+
+    if (( ahora - ultima_verificacion < SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER )); then
+        printf '%s|%s|%s\n' "$ultima_verificacion" "$mes_guardado" "$nivel_alertado_gb" > "$archivo_estado"
+        return 0
+    fi
+
+    inicio_rango="${mes_actual}-01T00:00:00Z"
+    fin_rango="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+    if ! gb_actual="$(obtener_cloudwatch_logs_ingestion_gb "$inicio_rango" "$fin_rango")"; then
+        registrar "WARN" "cloudwatch_free_tier" "mes=${mes_actual} error=no_se_pudo_calcular"
+        printf '%s|%s|%s\n' "$ahora" "$mes_guardado" "$nivel_alertado_gb" > "$archivo_estado"
+        return 0
+    fi
+
+    registrar "INFO" "cloudwatch_free_tier" "mes=${mes_actual} ingestion_acumulada_gb=${gb_actual} limite_free_tier_gb=${UMBRAL_CLOUDWATCH_FREE_TIER_GB} nivel_alertado_gb=${nivel_alertado_gb}"
+
+    if mayor_igual "$gb_actual" "$UMBRAL_CLOUDWATCH_FREE_TIER_GB"; then
+        if mayor_igual "$nivel_alertado_gb" "0.01"; then
+            siguiente_umbral="$(awk -v n="$nivel_alertado_gb" -v inc="$UMBRAL_CLOUDWATCH_INCREMENTO_GB" 'BEGIN { printf "%.2f", n + inc }')"
+        else
+            siguiente_umbral="$UMBRAL_CLOUDWATCH_FREE_TIER_GB"
+        fi
+
+        while mayor_igual "$gb_actual" "$siguiente_umbral"; do
+            if mayor_igual "$nivel_alertado_gb" "0.01"; then
+                enviar_notificacion \
+                    "CloudWatch Logs +${UMBRAL_CLOUDWATCH_INCREMENTO_GB}GB sobre Free Tier - ${NOMBRE_SERVIDOR}" \
+                    "Ingestión de CloudWatch Logs en ${mes_actual}: ${gb_actual} GB, superó ${siguiente_umbral} GB (Free Tier=${UMBRAL_CLOUDWATCH_FREE_TIER_GB} GB)." \
+                    0 || true
+            else
+                enviar_notificacion \
+                    "Free Tier de CloudWatch Logs superado - ${NOMBRE_SERVIDOR}" \
+                    "Ingestión de CloudWatch Logs en ${mes_actual}: ${gb_actual} GB, superó el límite gratuito de ${UMBRAL_CLOUDWATCH_FREE_TIER_GB} GB. Desde aquí AWS cobra aproximadamente \$0.50/GB adicional." \
+                    0 || true
+            fi
+
+            nivel_alertado_gb="$siguiente_umbral"
+            siguiente_umbral="$(awk -v n="$siguiente_umbral" -v inc="$UMBRAL_CLOUDWATCH_INCREMENTO_GB" 'BEGIN { printf "%.2f", n + inc }')"
+        done
+    fi
+
+    printf '%s|%s|%s\n' "$ahora" "$mes_guardado" "$nivel_alertado_gb" > "$archivo_estado"
+}
+
 monitorear_aws() {
     local estado_rds="" estado_ec2=""
     local rds_cpu="" rds_memoria_bytes="" rds_memoria_mb="" rds_conexiones=""
@@ -3037,6 +3195,8 @@ monitorear_aws() {
             fi
         fi
     fi
+
+    monitorear_cloudwatch_free_tier
 
     if [[ -n "$EC2_INSTANCE_ID" ]]; then
         if ejecutar_aws ec2 describe-instance-status \
