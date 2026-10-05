@@ -269,6 +269,7 @@ Ahí se almacenan, entre otros:
 - cooldown independiente por ruta para alertas de crecimiento;
 - estado de la última anomalía de respaldo y su cooldown;
 - momento desde el cual falta el archivo de estado del respaldo, cuando aplica;
+- última verificación, mes vigente y escalón GB ya notificado del Free Tier de CloudWatch Logs;
 - lock de ejecución.
 
 No elimine este directorio durante la operación normal. Hacerlo reinicia la memoria persistente del monitor.
@@ -798,7 +799,10 @@ cloudwatch:GetMetricStatistics
 rds:DescribeDBInstances
 ec2:DescribeInstanceStatus
 logs:FilterLogEvents
+logs:DescribeLogGroups
 ```
+
+`logs:DescribeLogGroups` lo utiliza el chequeo de Free Tier de CloudWatch Logs (sección 13) para enumerar **todos** los log groups de la cuenta, no solo los de RDS; por eso requiere `Resource: "*"` y no puede acotarse a un ARN específico (a diferencia de `logs:FilterLogEvents`, que sí se limita al log group del Slow Query Log).
 
 Una política de referencia es:
 
@@ -811,7 +815,8 @@ Una política de referencia es:
       "Action": [
         "cloudwatch:GetMetricStatistics",
         "rds:DescribeDBInstances",
-        "ec2:DescribeInstanceStatus"
+        "ec2:DescribeInstanceStatus",
+        "logs:DescribeLogGroups"
       ],
       "Resource": "*"
     },
@@ -880,6 +885,29 @@ UMBRAL_RDS_LOG_GENERAL_MB=0
 `UMBRAL_RDS_LOG_GENERAL_MB=0` deja el chequeo en **modo observación**: se registra el volumen pero no se envía ninguna alerta. Esto es intencional mientras no exista una línea base de tráfico normal para este log group. Una vez que haya datos reales acumulados (revisando el evento `rds_log_general` en el log), se puede fijar un umbral distinto de `0` para que empiece a alertar con `TIEMPO_SOSTENIDO_RDS` de persistencia y el cooldown global (`SEGUNDOS_COOLDOWN_ALERTA`), igual que el resto de las métricas de esta sección.
 
 El general query log registra *toda* consulta, no solo las lentas, así que su volumen normal puede ser considerablemente mayor que el de `slowquery`. Un crecimiento repentino puede indicar tanto un problema de aplicación (bucle generando consultas) como actividad de reconocimiento/ataque (por ejemplo, un escaneo automatizado de inyección SQL). Este chequeo es un complemento a la detección de queries activas y slow queries, no un reemplazo.
+
+### Free Tier de CloudWatch Logs
+
+A diferencia del chequeo anterior (que vigila un log group puntual, minuto a minuto, para detectar anomalías), este vigila el **consumo mensual agregado de toda la cuenta**: AWS CloudWatch Logs ofrece 5 GB/mes de ingestión gratis ("Always Free", no vence a los 12 meses), y ese límite se evalúa sumando la ingestión de todos los log groups de la cuenta/región, no solo los de RDS.
+
+```bash
+CHECK_CLOUDWATCH_FREE_TIER_HABILITADO=1
+UMBRAL_CLOUDWATCH_FREE_TIER_GB=5
+UMBRAL_CLOUDWATCH_INCREMENTO_GB=3
+SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER=21600
+```
+
+El monitor enumera todos los log groups de la cuenta (`logs:DescribeLogGroups`) y suma la métrica `IncomingBytes` (`AWS/Logs`, estadística `Sum`) de cada uno desde el día 1 del mes hasta el momento de la consulta. Como esto implica una llamada por log group, el chequeo se limita a ejecutarse como máximo cada `SEGUNDOS_INTERVALO_CLOUDWATCH_FREE_TIER` segundos (21600 = 6 horas por defecto), independientemente de la frecuencia del daemon/CRON.
+
+Comportamiento de las alertas:
+
+- Se avisa **una sola vez** al cruzar `UMBRAL_CLOUDWATCH_FREE_TIER_GB`.
+- Superado ese límite, se avisa de nuevo cada vez que el consumo del mes sube `UMBRAL_CLOUDWATCH_INCREMENTO_GB` GB adicionales (con los valores por defecto: 8, 11, 14 GB...). Si el consumo saltó más de un escalón entre dos chequeos, se avisa una vez por cada escalón cruzado, sin saltarse ninguno.
+- Al detectar un cambio de mes calendario (UTC), se envía un resumen con el total GB ingerido en el mes recién cerrado, y el contador de escalones se reinicia para el nuevo mes.
+
+El evento registrado en `monitor.log` es `cloudwatch_free_tier`, con los campos `mes`, `ingestion_acumulada_gb`, `limite_free_tier_gb` y `nivel_alertado_gb` (este último indica hasta qué escalón ya se notificó en el mes vigente; `0` significa que todavía no se cruzó el Free Tier).
+
+Esta función reutiliza permisos de solo lectura ya descritos en la sección 12 (`cloudwatch:GetMetricStatistics`, `logs:DescribeLogGroups`); no requiere permisos de Billing/Cost Explorer ni acceso a la cuenta de pago (`freetier:GetFreeTierUsage` solo funciona desde la cuenta management de una organización, por lo que se evitó deliberadamente).
 
 ---
 
@@ -960,6 +988,15 @@ SEGUNDOS_COOLDOWN_MYSQL_SLOW_QUERY=3600
 ```
 
 Este cooldown se aplica por fingerprint, por lo que una query lógica ya alertada no vuelve a enviar Pushover durante una hora aunque reaparezca. Otras queries con fingerprint diferente pueden alertar de forma independiente. Una coincidencia con `REGEX_MYSQL_SLOW_QUERY_SEGURIDAD` conserva este cooldown por fingerprint, pero no necesita cumplir los thresholds normales de duración o repetición para generar su primera alerta.
+
+El Free Tier de CloudWatch Logs no usa un cooldown por tiempo, sino un umbral escalonado que avanza en incrementos de `UMBRAL_CLOUDWATCH_INCREMENTO_GB` GB:
+
+```bash
+UMBRAL_CLOUDWATCH_FREE_TIER_GB=5
+UMBRAL_CLOUDWATCH_INCREMENTO_GB=3
+```
+
+El estado persistente recuerda el último escalón ya notificado (`nivel_alertado_gb`). Cada chequeo compara el consumo acumulado del mes contra el **próximo** escalón (límite, límite+incremento, límite+2×incremento...) en vez de contra un cooldown temporal; así se evita repetir la misma alerta en cada ejecución mientras el consumo se mantiene estable, pero se sigue avisando a medida que el gasto efectivamente aumenta. El contador se reinicia al cambiar el mes calendario (UTC).
 
 ---
 
@@ -1417,6 +1454,14 @@ sudo grep '"evento":"rds_cloudwatch"' \
 | tail -30
 ```
 
+Ver el consumo del Free Tier de CloudWatch Logs:
+
+```bash
+sudo grep '"evento":"cloudwatch_free_tier"' \
+/var/log/monitor-servidor/monitor.log \
+| tail -30
+```
+
 Ver eventos de respaldo:
 
 ```bash
@@ -1789,6 +1834,35 @@ sudo -H aws cloudwatch get-metric-statistics \
   --profile agente-control-monitoring \
   --region us-east-2 \
   --output table
+```
+
+### Free Tier de CloudWatch Logs
+
+Listar todos los log groups de la cuenta con su tamaño almacenado:
+
+```bash
+sudo -H aws logs describe-log-groups \
+  --query 'logGroups[].{name:logGroupName,storedBytes:storedBytes,retentionDays:retentionInDays}' \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output table
+```
+
+Ingestión acumulada de un log group puntual en lo que va del mes (reemplace el log group; sume manualmente entre varios para aproximar el total de cuenta que calcula el monitor):
+
+```bash
+sudo -H aws cloudwatch get-metric-statistics \
+  --namespace AWS/Logs \
+  --metric-name IncomingBytes \
+  --dimensions Name=LogGroupName,Value=/aws/rds/instance/df-instancia-01/general \
+  --start-time "$(date -u +%Y-%m)-01T00:00:00Z" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 3600 \
+  --statistics Sum \
+  --query 'sum(Datapoints[].Sum)' \
+  --profile agente-control-monitoring \
+  --region us-east-2 \
+  --output text
 ```
 
 ### Slow Query Log en CloudWatch
