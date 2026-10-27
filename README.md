@@ -550,6 +550,16 @@ UMBRAL_APACHE_PHP_ERROR=1
 
 `PHP Warning`, `PHP Notice` y mensajes `Deprecated` quedan fuera de esta categoría por defecto para reducir ruido. Pueden incorporarse posteriormente ajustando la expresión regular en `monitor-servidor.conf` si se desea vigilarlos.
 
+La categoría **HTTP 5xx** se analiza sobre `access.log` usando el código de estado HTTP registrado:
+
+```bash
+CHECK_HTTP_ERRORS=true
+REGEX_APACHE_HTTP_ERROR='"(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT|TRACE) [^"]*HTTP/[0-9.]+" 5[0-9][0-9][[:space:]]'
+UMBRAL_APACHE_HTTP_ERROR=5
+```
+
+La expresión ancla al campo de la petición (`"%r"`), exigiendo el verbo HTTP y `HTTP/x.x` dentro de las comillas, antes de aceptar el número de 3 dígitos como código de estado. Esto evita que un `LogFormat` con columnas adicionales después de `%{User-Agent}i` (por ejemplo `%I` para bytes recibidos o `%D` para duración en microsegundos) confunda esos valores con un 5xx real cuando casualmente empiezan en 5. Si su `LogFormat` no incluye el método HTTP y la versión dentro de las comillas de la petición, ajuste esta expresión en `monitor-servidor.conf` sin modificar el script.
+
 Cada `sitio + categoría` mantiene su contador independiente y cada `sitio + tipo de log` mantiene su propio cursor. Configuración Apache y PHP / Aplicación utilizan claves de estado separadas, por lo que sus ocurrencias no se mezclan.
 
 ---
